@@ -1,0 +1,27 @@
+[project]
+name = "memes2"
+version = "0.1.0"
+description = "memes version 2!"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ipykernel >= 7.1",
+    "ipython >= 9.8",
+
+    "numpy >= 2.3",
+    "torch >= 2.10",
+    "einops >= 0.8",
+    "opt-einsum >= 3.4",
+
+    "matplotlib >= 3.10",
+    "mlflow-skinny >= 3.7",
+    "zstandard >= 0.25",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch"
+# note: change this when 2.10 stabilizes
+url = "https://download.pytorch.org/whl/test/cu130"

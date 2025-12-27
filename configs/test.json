@@ -1,0 +1,22 @@
+{
+  "model_config": {
+    "d_hidden_latent": 512,
+    "d_intermediate_latent": 2048,
+    "d_hidden_bytelevel": 128,
+    "d_intermediate_bytelevel": 512,
+    "latent_to_bytes_ratio": 4,
+    "n_bytelevel_layers": 1,
+    "n_latent_layers": 6,
+    "n_attention_heads": 8,
+    "activation": "silu",
+    "dtype": "bf16",
+    "qkv_bias": true
+  },
+  "train_config": {
+    "lr": 1e-4,
+    "weight_decay": 0.05,
+    "batch_size": 32,
+    "accumulate_gradients": 1,
+    "optimizer": "AdamW"
+  }
+}

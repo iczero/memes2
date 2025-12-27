@@ -1,0 +1,1 @@
+- RMSNorm/LayerNorm equivalence: <https://arxiv.org/pdf/2305.14858>
