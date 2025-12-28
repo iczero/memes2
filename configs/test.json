@@ -4,12 +4,12 @@
     "d_hidden_latent": 512,
     "d_hidden_bytelevel": 128,
     "d_qkv_bytelevel": 32,
-    "latent_to_bytes_ratio": 4,
+    "bytes_per_latent": 4,
     "n_bytelevel_encode_layers": 1,
     "n_bytelevel_decode_layers": 1,
     "n_latent_layers": 6,
     "activation": "silu",
-    "dtype": "bf16",
+    "dtype": "bfloat16",
     "qkv_bias": true
   },
   "train_config": {

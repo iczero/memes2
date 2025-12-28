@@ -3,11 +3,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from model.common import ModelConfig
 from model.rotary_encoding import RotaryPositionalEncoding
 
 # batch, seq, d_hidden
-
-ROPE_SEQ_LEN = 16384
 
 class FeedforwardGLU(nn.Module):
     "Feedforward layer using GLU"
@@ -38,9 +37,10 @@ class SelfAttention(nn.Module):
         d_hidden: int,
         d_qkv: int,
         n_attention_heads: int,
-        use_rope: bool | RotaryPositionalEncoding = True,
+        rope: RotaryPositionalEncoding | None = None,
         bias=True
     ):
+        super().__init__()
         self.d_hidden = d_hidden
         self.d_qkv = d_qkv
         self.n_attention_heads = n_attention_heads
@@ -53,13 +53,9 @@ class SelfAttention(nn.Module):
             bias=bias
         )
 
-        if isinstance(use_rope, nn.Module):
-            self.rope = use_rope
-            assert self.rope.d_hidden() == d_qkv, "RoPE d_hidden mismatch"
-        elif use_rope:
-            self.rope = RotaryPositionalEncoding(d_qkv, ROPE_SEQ_LEN)
-        else:
-            self.rope = None
+        self.rope = rope
+        if rope is not None:
+            assert rope.d_hidden() == d_qkv, "RoPE d_hidden mismatch"
 
         self.w_out = nn.Linear(
             n_attention_heads * d_qkv,
@@ -104,85 +100,47 @@ def reshape_last(x: torch.Tensor, new_dim: int) -> torch.Tensor:
     "Reshape the last dimension of a tensor"
     return x.flatten(-2, -1).unflatten(-1, (-1, new_dim))
 
-# byte-level to latent attention layer
-class ByteToLatentAttention(nn.Module):
-    def __init__(
-        self,
-        d_hidden_latent: int,
-        d_hidden_bytelevel: int,
-        d_qkv_bytelevel: int,
-        bytes_per_latent: int,
-        n_attention_heads: int,
-        rope_bytelevel: RotaryPositionalEncoding,
-        bias=True,
-    ):
-        self.d_hidden_latent = d_hidden_latent
-        self.d_hidden_bytelevel = d_hidden_bytelevel
-        self.d_qkv_bytelevel = d_qkv_bytelevel
-        self.bytes_per_latent = bytes_per_latent
-        self.n_attention_heads = n_attention_heads
+def ByteToLatentAttention(
+    d_hidden_bytelevel: int,
+    d_hidden_latent: int,
+    d_qkv_bytelevel: int,
+    bytes_per_latent: int,
+    n_attention_heads: int,
+    rope_bytelevel: RotaryPositionalEncoding,
+    bias=True,
+) -> ResamplingAttention:
+    return ResamplingAttention(
+        d_hidden_bytelevel,
+        d_hidden_latent,
+        d_qkv_bytelevel,
+        bytes_per_latent * d_hidden_bytelevel,
+        n_attention_heads,
+        rope_bytelevel,
+        bytes_per_latent,
+        1,
+        bias,
+    )
 
-        self.pre_norm = nn.RMSNorm([d_hidden_bytelevel], elementwise_affine=True)
-
-        # query: byte -> concat -> w_q -> sdpa
-        self.w_q = nn.Linear(
-            bytes_per_latent * d_hidden_bytelevel,
-            n_attention_heads * d_qkv_bytelevel,
-            bias=bias,
-        )
-        # key/value: input to d_qkv
-        self.w_kv_merged = nn.Linear(
-            d_hidden_bytelevel,
-            2 * n_attention_heads * d_qkv_bytelevel,
-            bias=bias,
-        )
-
-        self.rope_bytelevel = rope_bytelevel
-        assert self.rope_bytelevel.d_hidden == d_qkv_bytelevel
-
-        self.w_out = nn.Linear(n_attention_heads * d_qkv_bytelevel, d_hidden_latent)
-
-        # bypass is transformed with linear before being added
-        # byte -> merge -> bypass_proj -> latent
-        # (worst case it becomes zero)
-        self.bypass_linear = nn.Linear(bytes_per_latent * d_hidden_bytelevel, d_hidden_latent, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normalized = self.pre_norm(x)
-
-        # form byte groups
-        bytelevel_merged = normalized.flatten(-2, -1) \
-            .unflatten(-1, (-1, self.d_hidden_bytelevel * self.bytes_per_latent))
-
-        q = einops.rearrange(
-            self.w_q(bytelevel_merged),
-            '... seq (heads d_qkv) -> ... heads seq d_qkv',
-            heads=self.n_attention_heads
-        )
-
-        kv_merged = einops.rearrange(
-            self.w_kv_merged(normalized),
-            '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
-            split=2, heads=self.n_attention_heads,
-        )
-        k = kv_merged[..., 0, :]
-        v = kv_merged[..., 1, :]
-
-        q = self.rope_bytelevel(q, stride=self.bytes_per_latent)
-        k = self.rope_bytelevel(k)
-
-        attn_out = F.scaled_dot_product_attention(q, k, v)
-        attn_concat = einops.rearrange(
-            attn_out,
-            '... heads seq d_qkv -> ... seq (heads d_qkv)',
-        )
-        out = self.w_out(attn_concat)
-
-        bytelevel_merged_bypass = x.flatten(-2, -1) \
-            .unflatten(-1, (-1, self.d_hidden_bytelevel * self.bytes_per_latent))
-        bypass = self.bypass_linear(bytelevel_merged_bypass)
-
-        return out + bypass
+def LatentToByteAttention(
+    d_hidden_latent: int,
+    d_hidden_bytelevel: int,
+    d_qkv_latent: int,
+    bytes_per_latent: int,
+    n_attention_heads: int,
+    rope_latent: RotaryPositionalEncoding,
+    bias=True,
+) -> ResamplingAttention:
+    return ResamplingAttention(
+        d_hidden_latent,
+        d_hidden_bytelevel,
+        d_qkv_latent,
+        d_hidden_latent // bytes_per_latent,
+        n_attention_heads,
+        rope_latent,
+        1,
+        bytes_per_latent,
+        bias,
+    )
 
 class ResamplingAttention(nn.Module):
     def __init__(
@@ -197,6 +155,7 @@ class ResamplingAttention(nn.Module):
         rope_stride_k: int,
         bias=True,
     ):
+        super().__init__()
         self.d_hidden_in = d_hidden_in
         self.d_hidden_out = d_hidden_out
         self.d_qkv = d_qkv
@@ -221,7 +180,7 @@ class ResamplingAttention(nn.Module):
         )
 
         self.rope = rope
-        assert self.rope.d_hidden == d_qkv
+        assert self.rope.d_hidden() == d_qkv
 
         self.w_out = nn.Linear(n_attention_heads * d_qkv, d_hidden_out)
 
@@ -264,24 +223,99 @@ class ResamplingAttention(nn.Module):
 
         return out + bypass
 
-# latent to byte-level attention layer
-class LatentToByteAttention(nn.Module):
-    def __init__(
-        self,
-        d_hidden_latent: int,
-        d_hidden_bytelevel: int,
-        bytes_per_latent: int,
-        n_attention_heads: int,
-    ):
-        # TODO: should we do q/k at latent dim or bytelevel dim?
-        # query: generate bytes_per_latent queries per latent input
-        # key: keep dimensions
-        self.w_qk_merged = nn.Linear(d_hidden_latent, d_hidden_latent)
-        # value: down-project latent to byte
-        # residual is transformed with linear before being added
-        # latent -> resid_proj -> split -> byte
-        self.resid_linear = nn.Linear(d_hidden_latent, d_hidden_latent)
-        pass
+class QuestionableTransformer(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.rope_bytelevel = RotaryPositionalEncoding(
+            config.d_qkv_bytelevel,
+            config.max_seq_len
+        )
+        self.rope_latent = RotaryPositionalEncoding(
+            config.d_qkv_latent,
+            (config.max_seq_len + config.bytes_per_latent - 1) // config.bytes_per_latent
+        )
+
+        self.embedding = nn.Embedding(config.vocab_size_, config.d_hidden_bytelevel)
+
+        self.encode_layers = nn.ModuleList()
+        for _ in range(0, config.n_bytelevel_encode_layers):
+            self.encode_layers.append(SelfAttention(
+                config.d_hidden_bytelevel,
+                config.d_qkv_bytelevel,
+                config.n_attention_heads,
+                self.rope_bytelevel,
+                config.qkv_bias,
+            ))
+            self.encode_layers.append(FeedforwardGLU(
+                config.d_hidden_bytelevel,
+                config.d_intermediate_bytelevel,
+                config.get_activation()
+            ))
+
+        self.intermediate_layers = nn.ModuleList()
+        for i in range(0, config.n_latent_layers):
+            if i == 0:
+                self.intermediate_layers.append(ByteToLatentAttention(
+                    config.d_hidden_bytelevel,
+                    config.d_hidden_latent,
+                    config.d_qkv_bytelevel,
+                    config.bytes_per_latent,
+                    config.n_attention_heads,
+                    self.rope_bytelevel,
+                    config.qkv_bias
+                ))
+            else:
+                self.intermediate_layers.append(SelfAttention(
+                    config.d_hidden_latent,
+                    config.d_qkv_latent,
+                    config.n_attention_heads,
+                    self.rope_latent,
+                    config.qkv_bias
+                ))
+
+            self.intermediate_layers.append(FeedforwardGLU(
+                config.d_hidden_latent,
+                config.d_intermediate_latent,
+                config.get_activation(),
+            ))
+
+        self.decode_layers = nn.ModuleList()
+        for i in range(0, config.n_bytelevel_decode_layers):
+            if i == 0:
+                self.decode_layers.append(LatentToByteAttention(
+                    config.d_hidden_latent,
+                    config.d_hidden_bytelevel,
+                    config.d_qkv_latent,
+                    config.bytes_per_latent,
+                    config.n_attention_heads,
+                    self.rope_latent,
+                    config.qkv_bias,
+                ))
+            else:
+                self.decode_layers.append(SelfAttention(
+                    config.d_hidden_bytelevel,
+                    config.d_qkv_bytelevel,
+                    config.n_attention_heads,
+                    self.rope_bytelevel,
+                    config.qkv_bias,
+                ))
+
+            self.decode_layers.append(FeedforwardGLU(
+                config.d_hidden_bytelevel,
+                config.d_intermediate_bytelevel,
+                config.get_activation(),
+            ))
+
+        self.lm_head = nn.Linear(config.d_hidden_bytelevel, config.vocab_size_, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pass
+        x = self.embedding(x)
+        for layer in self.encode_layers:
+            x = layer(x)
+        for layer in self.intermediate_layers:
+            x = layer(x)
+        for layer in self.decode_layers:
+            x = layer(x)
+        x = self.lm_head(x)
+        return x

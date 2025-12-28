@@ -1,7 +1,6 @@
 import dataclasses
 import enum
 import json
-import struct
 from typing import Self
 import typing
 
@@ -28,7 +27,7 @@ class ControlTokens(enum.IntEnum):
 def dataclass_from_dict(cls, obj: dict[str, typing.Any]):
     annotations = cls.__annotations__
     validated = {}
-    for k, v in obj.values():
+    for k, v in obj.items():
         if k not in annotations:
             raise ValueError(f'unexpected key {repr(k)}')
         if k.endswith('_'):
@@ -72,6 +71,8 @@ class ModelConfig:
     "Dimension of q/k/v vectors in byte-level layers"
     qkv_bias: bool = True
     "Whether Q/K/V linear layers in attention should have bias"
+    max_seq_len: int = 16384
+    "Maximum sequence length, in bytes (used by rope)"
     vocab_size_: int = 256 + len(ControlTokens)
     "Vocabulary size, not read from config"
 
@@ -81,6 +82,9 @@ class ModelConfig:
 
     # defaults
     def __post_init__(self):
+        assert self.n_bytelevel_encode_layers >= 1
+        assert self.n_bytelevel_decode_layers >= 1
+
         if self.d_intermediate_latent == 0:
             self.d_intermediate_latent = self.d_hidden_latent * 4
         if self.d_qkv_latent == 0:
@@ -165,3 +169,19 @@ class TrainConfig:
             )
 
         raise RuntimeError('unknown optimizer ' + self.optimizer)
+
+@dataclasses.dataclass
+class CombinedConfig:
+    model_config: ModelConfig
+    train_config: TrainConfig
+
+    @classmethod
+    def from_dict(cls, obj) -> Self:
+        return dataclass_from_dict(cls, obj)
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+def load_config(path: str):
+    with open(path, 'r') as f:
+        return CombinedConfig.from_dict(json.load(f))

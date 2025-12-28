@@ -46,4 +46,4 @@ class RotaryPositionalEncoding(nn.Module):
         return torch.stack((a2, b2), dim=-1).flatten(-2, -1)
 
     def d_hidden(self):
-        return self.cos_cached.shape[-1]
+        return self.cos_cached.shape[-1] * 2
