@@ -10,61 +10,77 @@ from model.rotary_encoding import RotaryPositionalEncoding
 ROPE_SEQ_LEN = 16384
 
 class FeedforwardGLU(nn.Module):
+    "Feedforward layer using GLU"
     def __init__(self, d_hidden: int, d_intermediate: int, activation, bias=True):
         super().__init__()
         self.d_intermediate = d_intermediate
         self.activation = activation
+        self.pre_norm = nn.RMSNorm([d_hidden], elementwise_affine=True)
         self.w1 = nn.Linear(d_hidden, d_intermediate * 2, bias=bias)
         self.w2 = nn.Linear(d_intermediate, d_hidden, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # do pre-norm
+        normalized = self.pre_norm(x)
         # hidden -> intermediate up-proj, split apart branches
-        w_a, w_b = self.w1(x).split(self.d_intermediate, dim=-1)
+        w_a, w_b = self.w1(normalized).split(self.d_intermediate, dim=-1)
         # run activation function, then multiply back
         intermediate = w_a * self.activation(w_b)
         # intermediate -> hidden down-proj, then add bypass
         return x + self.w2(intermediate)
 
 class SelfAttention(nn.Module):
-    rope: nn.Module | None
+    "Self attention layer"
+    rope: RotaryPositionalEncoding | None
 
-    def __init__(self, d_hidden: int, n_attention_heads: int, use_rope: bool | nn.Module = True, bias=True):
+    def __init__(
+        self,
+        d_hidden: int,
+        d_qkv: int,
+        n_attention_heads: int,
+        use_rope: bool | RotaryPositionalEncoding = True,
+        bias=True
+    ):
         self.d_hidden = d_hidden
+        self.d_qkv = d_qkv
         self.n_attention_heads = n_attention_heads
 
         self.pre_norm = nn.RMSNorm([d_hidden], elementwise_affine=True)
         # W_Q, W_K, W_V combined
         self.w_qkv_linear = nn.Linear(
             d_hidden,
-            3 * n_attention_heads * d_hidden,
+            3 * n_attention_heads * d_qkv,
             bias=bias
         )
 
         if isinstance(use_rope, nn.Module):
             self.rope = use_rope
+            assert self.rope.d_hidden() == d_qkv, "RoPE d_hidden mismatch"
         elif use_rope:
-            self.rope = RotaryPositionalEncoding(d_hidden, ROPE_SEQ_LEN)
+            self.rope = RotaryPositionalEncoding(d_qkv, ROPE_SEQ_LEN)
         else:
             self.rope = None
 
-        self.out_linear = nn.Linear(
-            n_attention_heads * d_hidden,
+        self.w_out = nn.Linear(
+            n_attention_heads * d_qkv,
             d_hidden,
             bias=bias,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # do pre-norm
+        normalized = self.pre_norm(x)
         qkv_merged = einops.rearrange(
-            self.w_qkv_linear(x),
+            self.w_qkv_linear(normalized),
             # transpose because SDPA wants heads before seq
-            '... seq (qkv heads hidden) -> ... heads seq qkv hidden',
-            hidden=self.d_hidden, heads=self.n_attention_heads, qkv=3,
+            '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
+            split=3, heads=self.n_attention_heads,
         )
         # unpack from merged
         q = qkv_merged[..., 0, :]
         k = qkv_merged[..., 1, :]
         v = qkv_merged[..., 2, :]
-        # q/k/v shape: (batch, heads, seq, d_hidden)
+        # q/k/v shape: (batch, heads, seq, d_qkv)
 
         if self.rope is not None:
             # apply RoPE
@@ -72,37 +88,192 @@ class SelfAttention(nn.Module):
             k = self.rope(k)
 
         attn_out = F.scaled_dot_product_attention(q, k, v)
-        # shape: (batch, heads, seq, d_hidden)
+        # shape: (batch, heads, seq, d_qkv)
 
         # transpose and concat
-        attn_concat = einops.rearrange(attn_out, '... heads seq hidden -> ... seq (heads hidden)')
-        merged = self.out_linear(attn_concat)
+        attn_concat = einops.rearrange(
+            attn_out,
+            '... heads seq d_qkv -> ... seq (heads d_qkv)'
+        )
+        out = self.w_out(attn_concat)
 
         # add bypass
-        return x + merged
+        return x + out
+
+def reshape_last(x: torch.Tensor, new_dim: int) -> torch.Tensor:
+    "Reshape the last dimension of a tensor"
+    return x.flatten(-2, -1).unflatten(-1, (-1, new_dim))
 
 # byte-level to latent attention layer
 class ByteToLatentAttention(nn.Module):
-    def __init__(self, d_hidden_latent: int, d_hidden_bytelevel: int, bytes_per_latent: int):
-        # TODO: both of these need n_attention_heads
-        # query: byte -> merge -> w_q -> sdpa (with the larger latent dim)
-        self.w_q = nn.Linear(d_hidden_latent, d_hidden_latent)
-        # key: up-project byte to latent to match query
-        # value: up-project byte to latent for merged out
-        self.w_kv_merged = nn.Linear(d_hidden_bytelevel, d_hidden_latent * 2)
-        # residual is transformed with linear before being added
-        # byte -> merge -> resid_proj -> latent
+    def __init__(
+        self,
+        d_hidden_latent: int,
+        d_hidden_bytelevel: int,
+        d_qkv_bytelevel: int,
+        bytes_per_latent: int,
+        n_attention_heads: int,
+        rope_bytelevel: RotaryPositionalEncoding,
+        bias=True,
+    ):
+        self.d_hidden_latent = d_hidden_latent
+        self.d_hidden_bytelevel = d_hidden_bytelevel
+        self.d_qkv_bytelevel = d_qkv_bytelevel
+        self.bytes_per_latent = bytes_per_latent
+        self.n_attention_heads = n_attention_heads
+
+        self.pre_norm = nn.RMSNorm([d_hidden_bytelevel], elementwise_affine=True)
+
+        # query: byte -> concat -> w_q -> sdpa
+        self.w_q = nn.Linear(
+            bytes_per_latent * d_hidden_bytelevel,
+            n_attention_heads * d_qkv_bytelevel,
+            bias=bias,
+        )
+        # key/value: input to d_qkv
+        self.w_kv_merged = nn.Linear(
+            d_hidden_bytelevel,
+            2 * n_attention_heads * d_qkv_bytelevel,
+            bias=bias,
+        )
+
+        self.rope_bytelevel = rope_bytelevel
+        assert self.rope_bytelevel.d_hidden == d_qkv_bytelevel
+
+        self.w_out = nn.Linear(n_attention_heads * d_qkv_bytelevel, d_hidden_latent)
+
+        # bypass is transformed with linear before being added
+        # byte -> merge -> bypass_proj -> latent
         # (worst case it becomes zero)
-        self.resid_linear = nn.Linear(d_hidden_latent, d_hidden_latent)
+        self.bypass_linear = nn.Linear(bytes_per_latent * d_hidden_bytelevel, d_hidden_latent, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pass
+        normalized = self.pre_norm(x)
+
+        # form byte groups
+        bytelevel_merged = normalized.flatten(-2, -1) \
+            .unflatten(-1, (-1, self.d_hidden_bytelevel * self.bytes_per_latent))
+
+        q = einops.rearrange(
+            self.w_q(bytelevel_merged),
+            '... seq (heads d_qkv) -> ... heads seq d_qkv',
+            heads=self.n_attention_heads
+        )
+
+        kv_merged = einops.rearrange(
+            self.w_kv_merged(normalized),
+            '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
+            split=2, heads=self.n_attention_heads,
+        )
+        k = kv_merged[..., 0, :]
+        v = kv_merged[..., 1, :]
+
+        q = self.rope_bytelevel(q, stride=self.bytes_per_latent)
+        k = self.rope_bytelevel(k)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_concat = einops.rearrange(
+            attn_out,
+            '... heads seq d_qkv -> ... seq (heads d_qkv)',
+        )
+        out = self.w_out(attn_concat)
+
+        bytelevel_merged_bypass = x.flatten(-2, -1) \
+            .unflatten(-1, (-1, self.d_hidden_bytelevel * self.bytes_per_latent))
+        bypass = self.bypass_linear(bytelevel_merged_bypass)
+
+        return out + bypass
+
+class ResamplingAttention(nn.Module):
+    def __init__(
+        self,
+        d_hidden_in: int,
+        d_hidden_out: int,
+        d_qkv: int,
+        d_hidden_in_reshape: int,
+        n_attention_heads: int,
+        rope: RotaryPositionalEncoding,
+        rope_stride_q: int,
+        rope_stride_k: int,
+        bias=True,
+    ):
+        self.d_hidden_in = d_hidden_in
+        self.d_hidden_out = d_hidden_out
+        self.d_qkv = d_qkv
+        self.d_hidden_in_reshape = d_hidden_in_reshape
+        self.n_attention_heads = n_attention_heads
+        self.rope_stride_q = rope_stride_q
+        self.rope_stride_k = rope_stride_k
+
+        self.pre_norm = nn.RMSNorm([d_hidden_in], elementwise_affine=True)
+
+        # query: byte -> concat -> w_q -> sdpa
+        self.w_q = nn.Linear(
+            d_hidden_in_reshape,
+            n_attention_heads * d_qkv,
+            bias=bias,
+        )
+        # key/value: input to d_qkv
+        self.w_kv_merged = nn.Linear(
+            d_hidden_in,
+            2 * n_attention_heads * d_qkv,
+            bias=bias,
+        )
+
+        self.rope = rope
+        assert self.rope.d_hidden == d_qkv
+
+        self.w_out = nn.Linear(n_attention_heads * d_qkv, d_hidden_out)
+
+        # bypass is transformed with linear before being added
+        # byte -> merge -> bypass_proj -> latent
+        # (worst case it becomes zero)
+        self.bypass_linear = nn.Linear(d_hidden_in_reshape, d_hidden_out, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = self.pre_norm(x)
+
+        # form byte groups
+        hidden_reshaped = reshape_last(normalized, self.d_hidden_in_reshape)
+
+        q = einops.rearrange(
+            self.w_q(hidden_reshaped),
+            '... seq (heads d_qkv) -> ... heads seq d_qkv',
+            heads=self.n_attention_heads
+        )
+
+        kv_merged = einops.rearrange(
+            self.w_kv_merged(normalized),
+            '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
+            split=2, heads=self.n_attention_heads,
+        )
+        k = kv_merged[..., 0, :]
+        v = kv_merged[..., 1, :]
+
+        q = self.rope(q, stride=self.rope_stride_q)
+        k = self.rope(k, stride=self.rope_stride_k)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_concat = einops.rearrange(
+            attn_out,
+            '... heads seq d_qkv -> ... seq (heads d_qkv)',
+        )
+        out = self.w_out(attn_concat)
+
+        bypass = self.bypass_linear(reshape_last(x, self.d_hidden_in_reshape))
+
+        return out + bypass
 
 # latent to byte-level attention layer
-class LatentToByte(nn.Module):
-    def __init__(self, d_hidden_latent: int, d_hidden_bytelevel: int, bytes_per_latent: int):
+class LatentToByteAttention(nn.Module):
+    def __init__(
+        self,
+        d_hidden_latent: int,
+        d_hidden_bytelevel: int,
+        bytes_per_latent: int,
+        n_attention_heads: int,
+    ):
         # TODO: should we do q/k at latent dim or bytelevel dim?
-        #       if we want to keep relative compute cost the same, it should be bytelevel dim
         # query: generate bytes_per_latent queries per latent input
         # key: keep dimensions
         self.w_qk_merged = nn.Linear(d_hidden_latent, d_hidden_latent)

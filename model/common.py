@@ -3,6 +3,7 @@ import enum
 import json
 import struct
 from typing import Self
+import typing
 
 import torch
 from torch import nn
@@ -24,20 +25,35 @@ class ControlTokens(enum.IntEnum):
     UNUSED_6 = 262
     UNUSED_7 = 263
 
+def dataclass_from_dict(cls, obj: dict[str, typing.Any]):
+    annotations = cls.__annotations__
+    validated = {}
+    for k, v in obj.values():
+        if k not in annotations:
+            raise ValueError(f'unexpected key {repr(k)}')
+        if k.endswith('_'):
+            raise ValueError(f'encountered non-configurable key {repr(k)}')
+
+        wanted_type = annotations[k]
+        if wanted_type in (int, float, str, bool):
+            validated[k] = wanted_type(v)
+        else:
+            validated[k] = dataclass_from_dict(wanted_type, v)
+
+    return cls(**validated)
+
 @dataclasses.dataclass
 class ModelConfig:
     d_hidden_latent: int
     "Hidden dimension size (aka model dimension) of latent layers"
-    d_intermediate_latent: int
-    "Size of feedforward inner dimension (usually 4 * d_hidden_latent) of latent layers"
     d_hidden_bytelevel: int
     "Hidden dimension size of byte-level layers"
-    d_intermediate_bytelevel: int
-    "Intermediate dimension size of byte-level layers"
     bytes_per_latent: int
     "How many bytes per latent (integer)"
-    n_bytelevel_layers: int
-    "How many byte-level layers to have per encode and decode"
+    n_bytelevel_encode_layers: int
+    "How many byte-level layers for encode"
+    n_bytelevel_decode_layers: int
+    "How many byte-level layers for decode"
     n_latent_layers: int
     "How many latent layers to have in the model"
     n_attention_heads: int
@@ -46,26 +62,33 @@ class ModelConfig:
     "Activation function"
     dtype: str
     "Data type of model"
-    qkv_bias: bool
+    d_intermediate_latent: int = 0
+    "Size of feedforward inner dimension (usually 4 * d_hidden_latent) of latent layers"
+    d_qkv_latent: int = 0
+    "Dimension of q/k/v vectors for attention in latent layers"
+    d_intermediate_bytelevel: int = 0
+    "Intermediate dimension size of byte-level layers"
+    d_qkv_bytelevel: int = 0
+    "Dimension of q/k/v vectors in byte-level layers"
+    qkv_bias: bool = True
     "Whether Q/K/V linear layers in attention should have bias"
-    vocab_size: int = 256 + len(ControlTokens)
+    vocab_size_: int = 256 + len(ControlTokens)
     "Vocabulary size, not read from config"
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
-        return cls(
-            d_hidden_latent=int(obj['d_hidden_latent']),
-            d_intermediate_latent=int(obj['d_intermediate_latent']),
-            d_hidden_bytelevel=int(obj['d_hidden_bytelevel']),
-            d_intermediate_bytelevel=int(obj['d_intermediate_bytelevel']),
-            bytes_per_latent=int(obj['bytes_per_latent']),
-            n_bytelevel_layers=int(obj['n_bytelevel_layers']),
-            n_latent_layers=int(obj['n_latent_layers']),
-            n_attention_heads=int(obj['n_attention_heads']),
-            activation=str(obj['activation']),
-            dtype=str(obj['dtype']),
-            qkv_bias=bool(obj['qkv_bias']),
-        )
+        return dataclass_from_dict(cls, obj)
+
+    # defaults
+    def __post_init__(self):
+        if self.d_intermediate_latent == 0:
+            self.d_intermediate_latent = self.d_hidden_latent * 4
+        if self.d_qkv_latent == 0:
+            self.d_qkv_latent = self.d_hidden_latent // self.n_attention_heads * 2
+        if self.d_intermediate_bytelevel == 0:
+            self.d_intermediate_bytelevel = self.d_hidden_bytelevel * 4
+        if self.d_qkv_bytelevel == 0:
+            self.d_qkv_bytelevel = self.d_hidden_bytelevel // self.n_attention_heads * 2
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -103,13 +126,7 @@ class TrainConfig:
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
-        return cls(
-            lr=float(obj['lr']),
-            weight_decay=float(obj['weight_decay']),
-            batch_size=int(obj['batch_size']),
-            optimizer=str(obj['optimizer']),
-            accumulate_gradients=int(obj['accumulate_gradients']),
-        )
+        return dataclass_from_dict(cls, obj)
 
     def to_dict(self):
         return dataclasses.asdict(self)
