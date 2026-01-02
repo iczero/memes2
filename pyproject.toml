@@ -16,6 +16,7 @@ dependencies = [
     "matplotlib >= 3.10",
     "mlflow-skinny >= 3.7",
     "zstandard >= 0.25",
+    "PySide6 >= 6.10",
 ]
 
 [tool.uv]

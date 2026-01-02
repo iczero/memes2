@@ -23,24 +23,21 @@ class RotaryPositionalEncoding(nn.Module):
         self.register_buffer('sin_cached', base.sin(), persistent=False)
         self.register_buffer('cos_cached', base.cos(), persistent=False)
 
-    def forward(self, x: torch.Tensor, stride = 1):
+    def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None):
         # [[ cos(m*t), -sin(m*t) ],  @  [[a],
         #  [ sin(m*t),  cos(m*t) ]]      [b]]
         # a2: cos(m*t) * a + sin(m*t) * -b
         # b2: sin(m*t) * a + cos(m*t) *  b
 
-        # strided rope is an experiment
-        # byte-level: 0 1 2 3   4 5 6 7
-        #     latent:   1         5
-        stride_start = (stride - 1) // 2
-        cos_cached = self.cos_cached[stride_start::stride, :]
-        sin_cached = self.sin_cached[stride_start::stride, :]
-
         # in: (batch..., seq, n_embed)
         a = x[..., 0::2]
         b = x[..., 1::2]
-        cos_resized = cos_cached.narrow(-2, 0, a.shape[-2])
-        sin_resized = sin_cached.narrow(-2, 0, a.shape[-2])
+        if positions is not None:
+            cos_resized = self.cos_cached[positions]
+            sin_resized = self.sin_cached[positions]
+        else:
+            cos_resized = self.cos_cached.narrow(-2, 0, a.shape[-2])
+            sin_resized = self.sin_cached.narrow(-2, 0, a.shape[-2])
         a2 = cos_resized * a + sin_resized * -b
         b2 = sin_resized * a + cos_resized * b
         return torch.stack((a2, b2), dim=-1).flatten(-2, -1)
