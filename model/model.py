@@ -25,8 +25,8 @@ class FeedforwardGLU(nn.Module):
         w_a, w_b = self.w1(normalized).split(self.d_intermediate, dim=-1)
         # run activation function, then multiply back
         intermediate = w_a * self.activation(w_b)
-        # intermediate -> hidden down-proj, then add bypass
-        return x + self.w2(intermediate)
+        # intermediate -> hidden down-proj
+        return self.w2(intermediate)
 
 class SelfAttention(nn.Module):
     "Self attention layer"
@@ -91,56 +91,75 @@ class SelfAttention(nn.Module):
             attn_out,
             '... heads seq d_qkv -> ... seq (heads d_qkv)'
         )
-        out = self.w_out(attn_concat)
+        return self.w_out(attn_concat)
 
-        # add bypass
-        return x + out
+class SinkhornKnopp(nn.Module):
+    "Sinkhorn-Knopp operator as defined in mHC paper"
+    def __init__(self, n_iter: int):
+        super().__init__()
+        self.n_iter = n_iter
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.exp()
+        for _i in range(0, self.n_iter):
+            x = F.normalize(x, p=1, dim=-1)
+            x = F.normalize(x, p=1, dim=-2)
+
+        return x
 
 def reshape_last(x: torch.Tensor, new_dim: int) -> torch.Tensor:
     "Reshape the last dimension of a tensor"
     return x.flatten(-2, -1).unflatten(-1, (-1, new_dim))
 
-def ByteToLatentAttention(
-    d_hidden_bytelevel: int,
-    d_hidden_latent: int,
-    d_qkv_bytelevel: int,
-    bytes_per_latent: int,
-    n_attention_heads: int,
-    rope_bytelevel: RotaryPositionalEncoding,
-    bias=True,
-) -> ResamplingAttention:
-    return ResamplingAttention(
-        d_hidden_bytelevel,
-        d_hidden_latent,
-        d_qkv_bytelevel,
-        bytes_per_latent * d_hidden_bytelevel,
-        n_attention_heads,
-        rope_bytelevel,
-        bytes_per_latent,
-        1,
-        bias,
-    )
+class ByteToLatentAttention(nn.Module):
+    def __init__(
+        self,
+        d_hidden_bytelevel: int,
+        d_hidden_latent: int,
+        d_qkv_bytelevel: int,
+        bytes_per_latent: int,
+        n_attention_heads: int,
+        rope_bytelevel: RotaryPositionalEncoding,
+        bias=True,
+    ):
+        super().__init__()
+        self.inner = ResamplingAttention(
+            d_hidden_bytelevel,
+            d_hidden_latent,
+            d_qkv_bytelevel,
+            bytes_per_latent * d_hidden_bytelevel,
+            n_attention_heads,
+            rope_bytelevel,
+            bias,
+        )
 
-def LatentToByteAttention(
-    d_hidden_latent: int,
-    d_hidden_bytelevel: int,
-    d_qkv_latent: int,
-    bytes_per_latent: int,
-    n_attention_heads: int,
-    rope_latent: RotaryPositionalEncoding,
-    bias=True,
-) -> ResamplingAttention:
-    return ResamplingAttention(
-        d_hidden_latent,
-        d_hidden_bytelevel,
-        d_qkv_latent,
-        d_hidden_latent // bytes_per_latent,
-        n_attention_heads,
-        rope_latent,
-        1,
-        bytes_per_latent,
-        bias,
-    )
+    def forward(self, x: torch.Tensor, rope_pos_bytelevel: torch.Tensor, rope_pos_latent: torch.Tensor):
+        return self.inner(x, rope_pos_latent, rope_pos_bytelevel)
+
+class LatentToByteAttention(nn.Module):
+    def __init__(
+        self,
+        d_hidden_latent: int,
+        d_hidden_bytelevel: int,
+        d_qkv_latent: int,
+        bytes_per_latent: int,
+        n_attention_heads: int,
+        rope_latent: RotaryPositionalEncoding,
+        bias=True,
+    ):
+        super().__init__()
+        self.inner = ResamplingAttention(
+            d_hidden_latent,
+            d_hidden_bytelevel,
+            d_qkv_latent,
+            d_hidden_latent // bytes_per_latent,
+            n_attention_heads,
+            rope_latent,
+            bias,
+        )
+
+    def forward(self, x: torch.Tensor, rope_pos_latent: torch.Tensor, rope_pos_bytelevel: torch.Tensor):
+        return self.inner(x, rope_pos_bytelevel, rope_pos_latent)
 
 class ResamplingAttention(nn.Module):
     def __init__(
@@ -151,8 +170,6 @@ class ResamplingAttention(nn.Module):
         d_hidden_in_reshape: int,
         n_attention_heads: int,
         rope: RotaryPositionalEncoding,
-        rope_stride_q: int,
-        rope_stride_k: int,
         bias=True,
     ):
         super().__init__()
@@ -161,8 +178,6 @@ class ResamplingAttention(nn.Module):
         self.d_qkv = d_qkv
         self.d_hidden_in_reshape = d_hidden_in_reshape
         self.n_attention_heads = n_attention_heads
-        self.rope_stride_q = rope_stride_q
-        self.rope_stride_k = rope_stride_k
 
         self.pre_norm = nn.RMSNorm([d_hidden_in], elementwise_affine=True)
 
@@ -189,18 +204,20 @@ class ResamplingAttention(nn.Module):
         # (worst case it becomes zero)
         self.bypass_linear = nn.Linear(d_hidden_in_reshape, d_hidden_out, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_pos_q: torch.Tensor, rope_pos_k: torch.Tensor) -> torch.Tensor:
         normalized = self.pre_norm(x)
 
-        # form byte groups
+        # group for latent, or split when going back to bytelevel
         hidden_reshaped = reshape_last(normalized, self.d_hidden_in_reshape)
 
+        # query from hidden_reshaped
         q = einops.rearrange(
             self.w_q(hidden_reshaped),
             '... seq (heads d_qkv) -> ... heads seq d_qkv',
             heads=self.n_attention_heads
         )
 
+        # key/value from previous sequence without concat/split
         kv_merged = einops.rearrange(
             self.w_kv_merged(normalized),
             '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
@@ -209,8 +226,8 @@ class ResamplingAttention(nn.Module):
         k = kv_merged[..., 0, :]
         v = kv_merged[..., 1, :]
 
-        q = self.rope(q, stride=self.rope_stride_q)
-        k = self.rope(k, stride=self.rope_stride_k)
+        q = self.rope(q, positions=rope_pos_q)
+        k = self.rope(k, positions=rope_pos_k)
 
         attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_concat = einops.rearrange(
@@ -219,6 +236,7 @@ class ResamplingAttention(nn.Module):
         )
         out = self.w_out(attn_concat)
 
+        # linear transform for skip connection
         bypass = self.bypass_linear(reshape_last(x, self.d_hidden_in_reshape))
 
         return out + bypass

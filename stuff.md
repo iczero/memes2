@@ -3,6 +3,14 @@
 - hyperconnections: <https://arxiv.org/pdf/2409.19606>
 - manifold-constrained hyperconnections: <https://arxiv.org/pdf/2512.24880>
 
+## Todo
+
+- rope using position
+- implement mHC for latent layers
+- switch to flex attention and document masking
+- implement windowed attention (+/- 128 chars or something) for bytelevel layers
+- actually train something
+
 ```py
 # strided rope is an experiment
 # byte-level: 0 1 2 3   4 5 6 7

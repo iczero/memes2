@@ -8,6 +8,7 @@
     "n_bytelevel_encode_layers": 1,
     "n_bytelevel_decode_layers": 1,
     "n_latent_layers": 6,
+    "hc_expansion": 4,
     "activation": "silu",
     "dtype": "bfloat16",
     "qkv_bias": true

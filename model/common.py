@@ -57,6 +57,8 @@ class ModelConfig:
     "How many latent layers to have in the model"
     n_attention_heads: int
     "Number of attention heads"
+    hc_expansion: int
+    "Hyperconnections expansion rate. Set to 1 to disable hyperconnections"
     activation: str
     "Activation function"
     dtype: str
@@ -73,6 +75,10 @@ class ModelConfig:
     "Whether Q/K/V linear layers in attention should have bias"
     max_seq_len: int = 16384
     "Maximum sequence length, in bytes (used by rope)"
+    hc_gating_init: float = 0.01
+    "Initialization for static gating parameters for hyperconnections"
+    hc_sk_iters: int = 16
+    "Sinkhorn-Knopp iterations for hyperconnections residual mixing"
     vocab_size_: int = 256 + len(ControlTokens)
     "Vocabulary size, not read from config"
 
