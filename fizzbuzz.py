@@ -15,13 +15,15 @@ train_config = combined_config.train_config
 
 device = torch.device('cuda')
 torch.set_float32_matmul_precision('high')
-model_dtype = model_config.get_dtype()
+model_dtype = torch.float32
 
 def make_fizzbuzz(x_min: int, x_max: int):
     pass
 
 model_config = load_config('configs/test.json').model_config
 model = QuestionableTransformer(model_config)
-model = model.to(device=device, dtype=model_config.get_dtype())
+model = model.to(device=device, dtype=model_dtype)
+
+# TODO: autocast bf16
 
 print('parameters:', sum(p.numel() for p in model.parameters()))

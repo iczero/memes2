@@ -61,8 +61,6 @@ class ModelConfig:
     "Hyperconnections expansion rate. Set to 1 to disable hyperconnections"
     activation: str
     "Activation function"
-    dtype: str
-    "Data type of model"
     d_intermediate_latent: int = 0
     "Size of feedforward inner dimension (usually 4 * d_hidden_latent) of latent layers"
     d_qkv_latent: int = 0
@@ -76,7 +74,7 @@ class ModelConfig:
     max_seq_len: int = 16384
     "Maximum sequence length, in bytes (used by rope)"
     hc_gating_init: float = 0.01
-    "Initialization for static gating parameters for hyperconnections"
+    "Initialization for learnable static gating parameters for hyperconnections"
     hc_sk_iters: int = 16
     "Sinkhorn-Knopp iterations for hyperconnections residual mixing"
     vocab_size_: int = 256 + len(ControlTokens)
@@ -102,12 +100,6 @@ class ModelConfig:
 
     def to_dict(self):
         return dataclasses.asdict(self)
-
-    def get_dtype(self):
-        return {
-            'float32': torch.float32,
-            'bfloat16': torch.bfloat16,
-        }[self.dtype]
 
     def get_activation(self):
         if self.activation == 'gelu':

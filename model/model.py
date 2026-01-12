@@ -241,6 +241,61 @@ class ResamplingAttention(nn.Module):
 
         return out + bypass
 
+class HyperconnectionParams(nn.Module):
+    def __init__(self, d_hidden: int, hc_expansion: int, hc_gating_init: float):
+        super().__init__()
+        self.d_hidden = d_hidden
+        self.hc_expansion = hc_expansion
+
+        self.norm = nn.RMSNorm([self.hc_expansion * self.d_hidden])
+        self.dynamic_proj = nn.Linear(
+            d_hidden * hc_expansion,
+            hc_expansion * (2 + hc_expansion),
+            bias=False,
+        )
+        self.gating_pre_post = nn.Parameter(torch.tensor([hc_gating_init] * 2))
+        self.gating_res = nn.Parameter(torch.tensor([hc_gating_init]))
+        self.static_mapping = nn.Parameter(torch.zeros((2 + hc_expansion, hc_expansion)))
+
+    def _combine_gating(self) -> torch.Tensor:
+        # combine gating into the form [[pre_gate], [post_gate], [res_gate], [res_gate], ...]
+        return torch.concat([
+            self.gating_pre_post,
+            self.gating_res.expand(self.hc_expansion),
+        ], dim=-1).unsqueeze(-1)
+
+    # returns: H_pre, H_post, H_res
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_norm = self.norm(x)
+        # compupte dynamic mappings for H_pre, H_post, H_res
+        dynamic_mapping = self.dynamic_proj(x_norm).unflatten(-1, (2 + self.hc_expansion, -1))
+        # apply learned gate to dynamic mappings
+        dyn_gated = dynamic_mapping * self._combine_gating()
+        # add static mappings
+        combined = dyn_gated + self.static_mapping
+        # split into H_pre, H_post, H_res
+        return combined.split([1, 1, self.hc_expansion], dim=-2)
+
+def hc_apply_pre(x_wide: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
+    # reshape residual stream from flat to 2d form
+    x_split = x_wide.unflatten(-1, (h_pre.shape[-1], -1))
+    # reweight by h_pre
+    x_reweight = x_split * h_pre.unsqueeze(-1)
+    # sum to obtain layer input
+    return x_reweight.sum(-2)
+
+def hc_apply_post(x_wide: torch.Tensor, layer_out: torch.Tensor, h_post: torch.Tensor, h_res: torch.Tensor) -> torch.Tensor:
+    # expand layer output and reweight by h_post
+    layer_out_expanded = layer_out.unsqueeze(-2) * h_post.unsqueeze(-1)
+    # convert skip from concated to 2d
+    x_split = x_wide.unflatten(-1, (h_res.shape[-1], -1))
+    # apply h_res to skip connection
+    x_reweight = h_res @ x_split
+    # merge layer out back into residual stream
+    merged = layer_out_expanded + x_reweight
+    # re-flatten residual stream
+    return merged.flatten(-2, -1)
+
 class QuestionableTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
