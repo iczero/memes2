@@ -1,12 +1,11 @@
 import einops
 import torch
+import torch.nn.attention.flex_attention as fa
 import torch.nn.functional as F
 from torch import nn
 
 from model.common import ModelConfig
 from model.rotary_encoding import RotaryPositionalEncoding
-
-# batch, seq, d_hidden
 
 class FeedforwardGLU(nn.Module):
     "Feedforward layer using GLU"
@@ -63,7 +62,13 @@ class SelfAttention(nn.Module):
             bias=bias,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor | None = None,
+        attn_score_mod = None,
+        attn_block_mask = None,
+    ) -> torch.Tensor:
         # do pre-norm
         normalized = self.pre_norm(x)
         qkv_merged = einops.rearrange(
@@ -80,10 +85,14 @@ class SelfAttention(nn.Module):
 
         if self.rope is not None:
             # apply RoPE
-            q = self.rope(q)
-            k = self.rope(k)
+            q = self.rope(q, rope_pos)
+            k = self.rope(k, rope_pos)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = fa.flex_attention(
+            q, k, v,
+            score_mod=attn_score_mod,
+            block_mask=attn_block_mask,
+        )
         # shape: (batch, heads, seq, d_qkv)
 
         # transpose and concat
@@ -133,8 +142,15 @@ class ByteToLatentAttention(nn.Module):
             bias,
         )
 
-    def forward(self, x: torch.Tensor, rope_pos_bytelevel: torch.Tensor, rope_pos_latent: torch.Tensor):
-        return self.inner(x, rope_pos_latent, rope_pos_bytelevel)
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_pos_bytelevel: torch.Tensor,
+        rope_pos_latent: torch.Tensor,
+        attn_score_mod,
+        attn_block_mask,
+    ):
+        return self.inner(x, rope_pos_latent, rope_pos_bytelevel, attn_score_mod, attn_block_mask)
 
 class LatentToByteAttention(nn.Module):
     def __init__(
@@ -158,8 +174,15 @@ class LatentToByteAttention(nn.Module):
             bias,
         )
 
-    def forward(self, x: torch.Tensor, rope_pos_latent: torch.Tensor, rope_pos_bytelevel: torch.Tensor):
-        return self.inner(x, rope_pos_bytelevel, rope_pos_latent)
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_pos_latent: torch.Tensor,
+        rope_pos_bytelevel: torch.Tensor,
+        attn_score_mod,
+        attn_block_mask,
+    ):
+        return self.inner(x, rope_pos_bytelevel, rope_pos_latent, attn_score_mod, attn_block_mask)
 
 class ResamplingAttention(nn.Module):
     def __init__(
@@ -204,7 +227,14 @@ class ResamplingAttention(nn.Module):
         # (worst case it becomes zero)
         self.bypass_linear = nn.Linear(d_hidden_in_reshape, d_hidden_out, bias=False)
 
-    def forward(self, x: torch.Tensor, rope_pos_q: torch.Tensor, rope_pos_k: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_pos_q: torch.Tensor,
+        rope_pos_k: torch.Tensor,
+        attn_score_mod,
+        attn_block_mask,
+    ) -> torch.Tensor:
         normalized = self.pre_norm(x)
 
         # group for latent, or split when going back to bytelevel
@@ -229,7 +259,11 @@ class ResamplingAttention(nn.Module):
         q = self.rope(q, positions=rope_pos_q)
         k = self.rope(k, positions=rope_pos_k)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = fa.flex_attention(
+            q, k, v,
+            score_mod=attn_score_mod,
+            block_mask=attn_block_mask,
+        )
         attn_concat = einops.rearrange(
             attn_out,
             '... heads seq d_qkv -> ... seq (heads d_qkv)',
@@ -242,7 +276,7 @@ class ResamplingAttention(nn.Module):
         return out + bypass
 
 class HyperconnectionParams(nn.Module):
-    def __init__(self, d_hidden: int, hc_expansion: int, hc_gating_init: float):
+    def __init__(self, d_hidden: int, hc_expansion: int, hc_gating_init: float, sk_iters: int):
         super().__init__()
         self.d_hidden = d_hidden
         self.hc_expansion = hc_expansion
@@ -256,6 +290,7 @@ class HyperconnectionParams(nn.Module):
         self.gating_pre_post = nn.Parameter(torch.tensor([hc_gating_init] * 2))
         self.gating_res = nn.Parameter(torch.tensor([hc_gating_init]))
         self.static_mapping = nn.Parameter(torch.zeros((2 + hc_expansion, hc_expansion)))
+        self.sk = SinkhornKnopp(sk_iters)
 
     def _combine_gating(self) -> torch.Tensor:
         # combine gating into the form [[pre_gate], [post_gate], [res_gate], [res_gate], ...]
@@ -274,7 +309,11 @@ class HyperconnectionParams(nn.Module):
         # add static mappings
         combined = dyn_gated + self.static_mapping
         # split into H_pre, H_post, H_res
-        return combined.split([1, 1, self.hc_expansion], dim=-2)
+        h_pre, h_post, h_res = combined.split([1, 1, self.hc_expansion], dim=-2)
+        h_pre = F.sigmoid(h_pre)
+        h_post = 2 * F.sigmoid(h_post)
+        h_res = self.sk(h_res)
+        return h_pre, h_post, h_res
 
 def hc_apply_pre(x_wide: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
     # reshape residual stream from flat to 2d form
@@ -295,6 +334,34 @@ def hc_apply_post(x_wide: torch.Tensor, layer_out: torch.Tensor, h_post: torch.T
     merged = layer_out_expanded + x_reweight
     # re-flatten residual stream
     return merged.flatten(-2, -1)
+
+class HcExpand(nn.Module):
+    def __init__(self, hc_expansion: int):
+        self.hc_expansion = hc_expansion
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # repeat input by hc_expansion times in last dimension
+        repeats = [1] * len(x.shape)
+        repeats[-1] = self.hc_expansion
+        return x.repeat(repeats)
+
+class HcMerge(nn.Module):
+    def __init__(self, hc_expansion: int):
+        self.hc_expansion = hc_expansion
+        self.merge_weights = nn.Parameter(torch.ones(hc_expansion))
+
+    def forward(self, x_wide: torch.Tensor) -> torch.Tensor:
+        # reshape to 2d form
+        x_split = x_wide.unflatten(-1, (self.hc_expansion, -1))
+        # apply weights
+        x_reweight = x_split * self.merge_weights.unsqueeze(-1)
+        # sum
+        return x_reweight.sum(-2)
+
+class ByteLevelEncodeBlock(nn.Module):
+    pass
+
+
 
 class QuestionableTransformer(nn.Module):
     def __init__(self, config: ModelConfig):

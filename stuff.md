@@ -3,6 +3,10 @@
 - hyperconnections: <https://arxiv.org/pdf/2409.19606>
 - manifold-constrained hyperconnections: <https://arxiv.org/pdf/2512.24880>
 
+## notes
+
+- input sequences must be padded to `bytes_per_latent` byte level tokens
+
 ## Todo
 
 - rope using position
@@ -18,4 +22,8 @@
 stride_start = (stride - 1) // 2
 cos_cached = self.cos_cached[stride_start::stride, :]
 sin_cached = self.sin_cached[stride_start::stride, :]
+```
+
+```py
+flex_attention.create_block_mask(mask_fn, None, None, q_len, kv_len, device)
 ```

@@ -10,7 +10,6 @@
     "n_latent_layers": 6,
     "hc_expansion": 4,
     "activation": "silu",
-    "dtype": "bfloat16",
     "qkv_bias": true
   },
   "train_config": {
