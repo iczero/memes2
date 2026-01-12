@@ -26,7 +26,7 @@ def create_fa_doc_mask(
     q_is_bytes: bool = False,
     kv_is_bytes: bool = False,
     additional_mask = None,
-    device: torch.device | None = None,
+    compile = False,
 ) -> fa.BlockMask:
     latent_len = doc_ids.shape[0]
     q_len = latent_len if not q_is_bytes else latent_len * bytes_per_latent
@@ -44,5 +44,6 @@ def create_fa_doc_mask(
         return out
 
     return fa.create_block_mask(
-        mask_mod, None, None, q_len, kv_len, device=device, _compile=False
+        mask_mod, None, None, q_len, kv_len,
+        device=doc_ids.device, _compile=compile
     )
