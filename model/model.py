@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from model.common import ModelConfig
+from model.masking import create_fa_doc_mask, lengths_to_bytelevel, lengths_to_doc_ids, lengths_to_positions
 from model.rotary_encoding import RotaryPositionalEncoding
 
 class FeedforwardGLU(nn.Module):
@@ -66,7 +67,6 @@ class SelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         rope_pos: torch.Tensor | None = None,
-        attn_score_mod = None,
         attn_block_mask = None,
     ) -> torch.Tensor:
         # do pre-norm
@@ -90,7 +90,6 @@ class SelfAttention(nn.Module):
 
         attn_out = fa.flex_attention(
             q, k, v,
-            score_mod=attn_score_mod,
             block_mask=attn_block_mask,
         )
         # shape: (batch, heads, seq, d_qkv)
@@ -147,10 +146,9 @@ class ByteToLatentAttention(nn.Module):
         x: torch.Tensor,
         rope_pos_bytelevel: torch.Tensor,
         rope_pos_latent: torch.Tensor,
-        attn_score_mod,
         attn_block_mask,
     ):
-        return self.inner(x, rope_pos_latent, rope_pos_bytelevel, attn_score_mod, attn_block_mask)
+        return self.inner(x, rope_pos_latent, rope_pos_bytelevel, attn_block_mask)
 
 class LatentToByteAttention(nn.Module):
     def __init__(
@@ -179,10 +177,9 @@ class LatentToByteAttention(nn.Module):
         x: torch.Tensor,
         rope_pos_latent: torch.Tensor,
         rope_pos_bytelevel: torch.Tensor,
-        attn_score_mod,
         attn_block_mask,
     ):
-        return self.inner(x, rope_pos_bytelevel, rope_pos_latent, attn_score_mod, attn_block_mask)
+        return self.inner(x, rope_pos_bytelevel, rope_pos_latent, attn_block_mask)
 
 class ResamplingAttention(nn.Module):
     def __init__(
@@ -232,7 +229,6 @@ class ResamplingAttention(nn.Module):
         x: torch.Tensor,
         rope_pos_q: torch.Tensor,
         rope_pos_k: torch.Tensor,
-        attn_score_mod,
         attn_block_mask,
     ) -> torch.Tensor:
         normalized = self.pre_norm(x)
@@ -261,7 +257,6 @@ class ResamplingAttention(nn.Module):
 
         attn_out = fa.flex_attention(
             q, k, v,
-            score_mod=attn_score_mod,
             block_mask=attn_block_mask,
         )
         attn_concat = einops.rearrange(
@@ -369,11 +364,11 @@ class QuestionableTransformer(nn.Module):
         self.config = config
         self.rope_bytelevel = RotaryPositionalEncoding(
             config.d_qkv_bytelevel,
-            config.max_seq_len
+            config.max_seq_len,
         )
         self.rope_latent = RotaryPositionalEncoding(
             config.d_qkv_latent,
-            (config.max_seq_len + config.bytes_per_latent - 1) // config.bytes_per_latent
+            config.max_seq_len,
         )
 
         self.embedding = nn.Embedding(config.vocab_size_, config.d_hidden_bytelevel)
@@ -449,7 +444,44 @@ class QuestionableTransformer(nn.Module):
 
         self.lm_head = nn.Linear(config.d_hidden_bytelevel, config.vocab_size_, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # note: seq_latent_lengths is latent length (i.e. byte_length // bytes_per_latent)
+    def forward(self, x: torch.Tensor, seq_lengths_latent: torch.Tensor) -> torch.Tensor:
+        bytes_per_latent = self.config.bytes_per_latent
+        seq_lengths_bytelevel = lengths_to_bytelevel(seq_lengths_latent, bytes_per_latent)
+        seq_positions_latent = lengths_to_positions(seq_lengths_latent)
+        seq_positions_bytelevel = lengths_to_positions(seq_lengths_bytelevel)
+        transition_stride_start = (bytes_per_latent - 1) // 2
+        seq_positions_bytelevel_transition = seq_positions_bytelevel[transition_stride_start::bytes_per_latent]
+        doc_ids_latent = lengths_to_doc_ids(seq_lengths_latent)
+        attn_mask_latent = create_fa_doc_mask(doc_ids_latent)
+        attn_mask_bytelevel = create_fa_doc_mask(
+            doc_ids_latent,
+            bytes_per_latent,
+            q_is_bytes=True,
+            kv_is_bytes=True,
+            # limit attention to +/- (bytelevel_attn_window / 2) surrounding bytes
+            additional_mask=lambda q_idx, kv_idx: (q_idx - kv_idx).abs() <= self.config.bytelevel_attn_window // 2,
+        )
+        attn_mask_bytelevel_to_latent = create_fa_doc_mask(
+            doc_ids_latent,
+            bytes_per_latent,
+            q_is_bytes=False,
+            kv_is_bytes=True,
+            # latent queries should attend to surrounding bytelevel_attn_window bytes (as groups of bytes_per_latent)
+            additional_mask=lambda q_idx, kv_idx: \
+                (q_idx - kv_idx // bytes_per_latent).abs() \
+                    <= self.config.bytelevel_attn_window // (2 * bytes_per_latent),
+        )
+        attn_mask_latent_to_bytelevel = create_fa_doc_mask(
+            doc_ids_latent,
+            bytes_per_latent,
+            q_is_bytes=True,
+            kv_is_bytes=False,
+            # bytelevel queries should attend to surrounding (bytelevel_attn_window / 4) latents
+            additional_mask=lambda q_idx, kv_idx: \
+                (q_idx // bytes_per_latent - kv_idx).abs() \
+                    <= self.config.bytelevel_attn_window // (2 * bytes_per_latent),
+        )
         x = self.embedding(x)
         for layer in self.encode_layers:
             x = layer(x)

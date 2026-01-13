@@ -5,6 +5,7 @@
     "d_hidden_bytelevel": 128,
     "d_qkv_bytelevel": 32,
     "bytes_per_latent": 4,
+    "bytelevel_attn_window": 128,
     "n_bytelevel_encode_layers": 1,
     "n_bytelevel_decode_layers": 1,
     "n_latent_layers": 6,

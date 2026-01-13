@@ -49,6 +49,10 @@ class ModelConfig:
     "Hidden dimension size of byte-level layers"
     bytes_per_latent: int
     "How many bytes per latent (integer)"
+    bytelevel_attn_window: int
+    "How many surrounding bytes each byte should attend to in bytelevel layers"
+    # note: layer counts do not include the bytelevel-to-latent and latent-to-bytelevel layer.
+    # hence, the total "layer count" is n_bytelevel_encode_layers + 1 + n_latent_layers + 1 + n_bytelevel_decode_layers.
     n_bytelevel_encode_layers: int
     "How many byte-level layers for encode"
     n_bytelevel_decode_layers: int

@@ -8,6 +8,9 @@ def lengths_to_doc_ids(lengths: torch.Tensor) -> torch.Tensor:
         device=lengths.device,
     ).repeat_interleave(lengths)
 
+def lengths_to_bytelevel(lengths: torch.Tensor, bytes_per_latent: int) -> torch.Tensor:
+    return lengths * bytes_per_latent
+
 def lengths_to_positions(lengths: torch.Tensor) -> torch.Tensor:
     construct_args = { 'device': lengths.device, 'dtype': lengths.dtype }
     cumsum = lengths.cumsum(dim=0)
@@ -33,6 +36,9 @@ def create_fa_doc_mask(
     kv_len = latent_len if not kv_is_bytes else latent_len * bytes_per_latent
 
     def mask_mod(_b, _h, q_idx, kv_idx) -> torch.Tensor:
+        q_idx_orig = q_idx
+        kv_idx_orig = kv_idx
+
         if q_is_bytes:
             q_idx = q_idx // bytes_per_latent
         if kv_is_bytes:
@@ -40,7 +46,7 @@ def create_fa_doc_mask(
 
         out = doc_ids[q_idx] == doc_ids[kv_idx]
         if additional_mask is not None:
-            out = out & additional_mask(q_idx, kv_idx)
+            out = out & additional_mask(q_idx_orig, kv_idx_orig)
         return out
 
     return fa.create_block_mask(
