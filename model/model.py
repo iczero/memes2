@@ -14,15 +14,12 @@ class FeedforwardGLU(nn.Module):
         super().__init__()
         self.d_intermediate = d_intermediate
         self.activation = activation
-        self.pre_norm = nn.RMSNorm([d_hidden], elementwise_affine=True)
         self.w1 = nn.Linear(d_hidden, d_intermediate * 2, bias=bias)
         self.w2 = nn.Linear(d_intermediate, d_hidden, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # do pre-norm
-        normalized = self.pre_norm(x)
         # hidden -> intermediate up-proj, split apart branches
-        w_a, w_b = self.w1(normalized).split(self.d_intermediate, dim=-1)
+        w_a, w_b = self.w1(x).split(self.d_intermediate, dim=-1)
         # run activation function, then multiply back
         intermediate = w_a * self.activation(w_b)
         # intermediate -> hidden down-proj
@@ -45,7 +42,6 @@ class SelfAttention(nn.Module):
         self.d_qkv = d_qkv
         self.n_attention_heads = n_attention_heads
 
-        self.pre_norm = nn.RMSNorm([d_hidden], elementwise_affine=True)
         # W_Q, W_K, W_V combined
         self.w_qkv_linear = nn.Linear(
             d_hidden,
@@ -70,9 +66,8 @@ class SelfAttention(nn.Module):
         attn_block_mask = None,
     ) -> torch.Tensor:
         # do pre-norm
-        normalized = self.pre_norm(x)
         qkv_merged = einops.rearrange(
-            self.w_qkv_linear(normalized),
+            self.w_qkv_linear(x),
             # transpose because SDPA wants heads before seq
             '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
             split=3, heads=self.n_attention_heads,
@@ -353,10 +348,32 @@ class HcMerge(nn.Module):
         # sum
         return x_reweight.sum(-2)
 
-class ByteLevelEncodeBlock(nn.Module):
-    pass
+class ByteLevelBlock(nn.Module):
+    def __init__(self, config: ModelConfig, rope_bytelevel: RotaryPositionalEncoding):
+        super().__init__()
+        self.attn_norm = nn.RMSNorm([config.d_hidden_bytelevel], elementwise_affine=True)
+        self.attention = SelfAttention(
+            config.d_hidden_bytelevel,
+            config.d_qkv_bytelevel,
+            config.n_attention_heads,
+            rope_bytelevel,
+            config.qkv_bias,
+        )
+        self.ff_norm = nn.RMSNorm([config.d_hidden_bytelevel], elementwise_affine=True)
+        self.feedforward = FeedforwardGLU(
+            config.d_hidden_bytelevel,
+            config.d_intermediate_bytelevel,
+            config.get_activation(),
+        )
 
-
+    def forward(self, x: torch.Tensor, rope_pos_bytelevel: torch.Tensor, attn_mask: fa.BlockMask):
+        x2 = self.attn_norm(x)
+        x2 = self.attention(x2, rope_pos_bytelevel, attn_mask)
+        x = x2 + x
+        x2 = self.ff_norm(x)
+        x2 = self.feedforward(x2)
+        x = x2 + x
+        return x
 
 class QuestionableTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
