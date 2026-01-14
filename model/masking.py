@@ -29,7 +29,7 @@ def create_fa_doc_mask(
     q_is_bytes: bool = False,
     kv_is_bytes: bool = False,
     additional_mask = None,
-    compile = True,
+    compile = False,
 ) -> fa.BlockMask:
     latent_len = doc_ids.shape[0]
     q_len = latent_len if not q_is_bytes else latent_len * bytes_per_latent

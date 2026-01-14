@@ -141,9 +141,9 @@ class ByteToLatentAttention(nn.Module):
         x: torch.Tensor,
         rope_pos_bytelevel: torch.Tensor,
         rope_pos_latent: torch.Tensor,
-        attn_block_mask,
+        attn_mask,
     ):
-        return self.inner(x, rope_pos_latent, rope_pos_bytelevel, attn_block_mask)
+        return self.inner(x, rope_pos_latent, rope_pos_bytelevel, attn_mask)
 
 class LatentToByteAttention(nn.Module):
     def __init__(
@@ -172,9 +172,9 @@ class LatentToByteAttention(nn.Module):
         x: torch.Tensor,
         rope_pos_latent: torch.Tensor,
         rope_pos_bytelevel: torch.Tensor,
-        attn_block_mask,
+        attn_mask,
     ):
-        return self.inner(x, rope_pos_bytelevel, rope_pos_latent, attn_block_mask)
+        return self.inner(x, rope_pos_bytelevel, rope_pos_latent, attn_mask)
 
 class ResamplingAttention(nn.Module):
     def __init__(
@@ -224,7 +224,7 @@ class ResamplingAttention(nn.Module):
         x: torch.Tensor,
         rope_pos_q: torch.Tensor,
         rope_pos_k: torch.Tensor,
-        attn_block_mask,
+        attn_mask: fa.BlockMask,
     ) -> torch.Tensor:
         normalized = self.pre_norm(x)
 
@@ -252,7 +252,7 @@ class ResamplingAttention(nn.Module):
 
         attn_out = fa.flex_attention(
             q, k, v,
-            block_mask=attn_block_mask,
+            block_mask=attn_mask,
         )
         attn_concat = einops.rearrange(
             attn_out,
@@ -348,7 +348,7 @@ class HcMerge(nn.Module):
         # sum
         return x_reweight.sum(-2)
 
-class ByteLevelBlock(nn.Module):
+class BytelevelBlock(nn.Module):
     def __init__(self, config: ModelConfig, rope_bytelevel: RotaryPositionalEncoding):
         super().__init__()
         self.attn_norm = nn.RMSNorm([config.d_hidden_bytelevel], elementwise_affine=True)
@@ -367,12 +367,122 @@ class ByteLevelBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, rope_pos_bytelevel: torch.Tensor, attn_mask: fa.BlockMask):
-        x2 = self.attn_norm(x)
-        x2 = self.attention(x2, rope_pos_bytelevel, attn_mask)
-        x = x2 + x
-        x2 = self.ff_norm(x)
-        x2 = self.feedforward(x2)
-        x = x2 + x
+        x_l = self.attn_norm(x)
+        x_l = self.attention(x_l, rope_pos_bytelevel, attn_mask)
+        x = x_l + x
+        x_l = self.ff_norm(x)
+        x_l = self.feedforward(x_l)
+        x = x_l + x
+        return x
+
+class LatentBlock(nn.Module):
+    def __init__(self, config: ModelConfig, rope_latent: RotaryPositionalEncoding):
+        super().__init__()
+        self.attn_hc_params = HyperconnectionParams(
+            config.d_hidden_latent,
+            config.hc_expansion,
+            config.hc_gating_init,
+            config.hc_sk_iters
+        )
+        self.attn_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.attention = SelfAttention(
+            config.d_hidden_latent,
+            config.d_qkv_latent,
+            config.n_attention_heads,
+            rope_latent,
+            config.qkv_bias,
+        )
+        self.ff_hc_params = HyperconnectionParams(
+            config.d_hidden_latent,
+            config.hc_expansion,
+            config.hc_gating_init,
+            config.hc_sk_iters
+        )
+        self.ff_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.feedforward = FeedforwardGLU(
+            config.d_hidden_latent,
+            config.d_intermediate_latent,
+            config.get_activation(),
+        )
+
+    def forward(self, x_wide: torch.Tensor, rope_pos_latent: torch.Tensor, attn_mask: fa.BlockMask):
+        h_pre, h_post, h_res = self.attn_hc_params(x_wide)
+        x_l = hc_apply_pre(x_wide, h_pre)
+        x_l = self.attn_norm(x_l)
+        x_l = self.attention(x_l, rope_pos_latent, attn_mask)
+        x_wide = hc_apply_post(x_wide, x_l, h_post, h_res)
+
+        h_pre, h_post, h_res = self.ff_hc_params(x_wide)
+        x_l = hc_apply_pre(x_wide, h_pre)
+        x_l = self.ff_norm(x_l)
+        x_l = self.feedforward(x_l)
+        x_wide = hc_apply_post(x_wide, x_l, h_post, h_res)
+        return x_wide
+
+class BytelevelToLatentBlock(nn.Module):
+    def __init__(self, config: ModelConfig, rope_bytelevel: RotaryPositionalEncoding):
+        super().__init__()
+        self.resample = ByteToLatentAttention(
+            config.d_hidden_bytelevel,
+            config.d_hidden_latent,
+            config.d_qkv_bytelevel,
+            config.bytes_per_latent,
+            config.n_attention_heads,
+            rope_bytelevel,
+        )
+        self.hc_expand = HcExpand(config.hc_expansion)
+        self.ff_hc_params = HyperconnectionParams(
+            config.d_hidden_latent,
+            config.hc_expansion,
+            config.hc_gating_init,
+            config.hc_sk_iters
+        )
+        self.ff_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.feedforward = FeedforwardGLU(
+            config.d_hidden_latent,
+            config.d_intermediate_latent,
+            config.get_activation(),
+        )
+
+    # note: rope_pos_latent should probably be strided
+    def forward(self, x: torch.Tensor, rope_pos_bytelevel: torch.Tensor, rope_pos_latent: torch.Tensor, attn_mask: fa.BlockMask):
+        x = self.resample(x, rope_pos_bytelevel, rope_pos_latent, attn_mask)
+        x_wide = self.hc_expand(x)
+
+        h_pre, h_post, h_res = self.ff_hc_params(x_wide)
+        x_l = hc_apply_pre(x_wide, h_pre)
+        x_l = self.ff_norm(x_l)
+        x_l = self.feedforward(x_l)
+        x_wide = hc_apply_post(x_wide, x_l, h_post, h_res)
+        return x_wide
+
+class LatentToBytelevelBlock(nn.Module):
+    def __init__(self, config: ModelConfig, rope_latent: RotaryPositionalEncoding):
+        super().__init__()
+        self.hc_merge = HcMerge(config.hc_expansion)
+        self.resample = LatentToByteAttention(
+            config.d_hidden_latent,
+            config.d_hidden_bytelevel,
+            config.d_qkv_latent,
+            config.bytes_per_latent,
+            config.n_attention_heads,
+            rope_latent,
+        )
+        self.ff_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.feedforward = FeedforwardGLU(
+            config.d_hidden_latent,
+            config.d_intermediate_latent,
+            config.get_activation(),
+        )
+
+    # note: rope_pos_latent should probably be strided
+    def forward(self, x_wide: torch.Tensor, rope_pos_latent: torch.Tensor, rope_pos_bytelevel: torch.Tensor, attn_mask: fa.BlockMask):
+        x = self.hc_merge(x_wide)
+        x = self.resample(x, rope_pos_latent, rope_pos_bytelevel, attn_mask)
+
+        x_l = self.ff_norm(x)
+        x_l = self.feedforward(x_l)
+        x = x_l + x
         return x
 
 class QuestionableTransformer(nn.Module):
@@ -390,74 +500,17 @@ class QuestionableTransformer(nn.Module):
 
         self.embedding = nn.Embedding(config.vocab_size_, config.d_hidden_bytelevel)
 
-        self.encode_layers = nn.ModuleList()
-        for _ in range(0, config.n_bytelevel_encode_layers):
-            self.encode_layers.append(SelfAttention(
-                config.d_hidden_bytelevel,
-                config.d_qkv_bytelevel,
-                config.n_attention_heads,
-                self.rope_bytelevel,
-                config.qkv_bias,
-            ))
-            self.encode_layers.append(FeedforwardGLU(
-                config.d_hidden_bytelevel,
-                config.d_intermediate_bytelevel,
-                config.get_activation()
-            ))
-
-        self.intermediate_layers = nn.ModuleList()
-        for i in range(0, config.n_latent_layers):
-            if i == 0:
-                self.intermediate_layers.append(ByteToLatentAttention(
-                    config.d_hidden_bytelevel,
-                    config.d_hidden_latent,
-                    config.d_qkv_bytelevel,
-                    config.bytes_per_latent,
-                    config.n_attention_heads,
-                    self.rope_bytelevel,
-                    config.qkv_bias
-                ))
-            else:
-                self.intermediate_layers.append(SelfAttention(
-                    config.d_hidden_latent,
-                    config.d_qkv_latent,
-                    config.n_attention_heads,
-                    self.rope_latent,
-                    config.qkv_bias
-                ))
-
-            self.intermediate_layers.append(FeedforwardGLU(
-                config.d_hidden_latent,
-                config.d_intermediate_latent,
-                config.get_activation(),
-            ))
-
-        self.decode_layers = nn.ModuleList()
-        for i in range(0, config.n_bytelevel_decode_layers):
-            if i == 0:
-                self.decode_layers.append(LatentToByteAttention(
-                    config.d_hidden_latent,
-                    config.d_hidden_bytelevel,
-                    config.d_qkv_latent,
-                    config.bytes_per_latent,
-                    config.n_attention_heads,
-                    self.rope_latent,
-                    config.qkv_bias,
-                ))
-            else:
-                self.decode_layers.append(SelfAttention(
-                    config.d_hidden_bytelevel,
-                    config.d_qkv_bytelevel,
-                    config.n_attention_heads,
-                    self.rope_bytelevel,
-                    config.qkv_bias,
-                ))
-
-            self.decode_layers.append(FeedforwardGLU(
-                config.d_hidden_bytelevel,
-                config.d_intermediate_bytelevel,
-                config.get_activation(),
-            ))
+        self.bytelevel_encode_layers = nn.ModuleList(
+            [BytelevelBlock(config, self.rope_bytelevel) for _i in range(config.n_bytelevel_encode_layers)]
+        )
+        self.bytelevel_to_latent = BytelevelToLatentBlock(config, self.rope_bytelevel)
+        self.latent_layers = nn.ModuleList(
+            [LatentBlock(config, self.rope_latent) for _i in range(config.n_latent_layers)]
+        )
+        self.latent_to_bytelevel = LatentToBytelevelBlock(config, self.rope_latent)
+        self.bytelevel_decode_layers = nn.ModuleList(
+            [BytelevelBlock(config, self.rope_bytelevel) for _i in range(config.n_bytelevel_decode_layers)]
+        )
 
         self.lm_head = nn.Linear(config.d_hidden_bytelevel, config.vocab_size_, bias=False)
 
@@ -465,10 +518,10 @@ class QuestionableTransformer(nn.Module):
     def forward(self, x: torch.Tensor, seq_lengths_latent: torch.Tensor) -> torch.Tensor:
         bytes_per_latent = self.config.bytes_per_latent
         seq_lengths_bytelevel = lengths_to_bytelevel(seq_lengths_latent, bytes_per_latent)
-        seq_positions_latent = lengths_to_positions(seq_lengths_latent)
+        #seq_positions_latent = lengths_to_positions(seq_lengths_latent)
         seq_positions_bytelevel = lengths_to_positions(seq_lengths_bytelevel)
         transition_stride_start = (bytes_per_latent - 1) // 2
-        seq_positions_bytelevel_transition = seq_positions_bytelevel[transition_stride_start::bytes_per_latent]
+        seq_positions_latent_strided = seq_positions_bytelevel[transition_stride_start::bytes_per_latent]
         doc_ids_latent = lengths_to_doc_ids(seq_lengths_latent)
         attn_mask_latent = create_fa_doc_mask(doc_ids_latent)
         attn_mask_bytelevel = create_fa_doc_mask(
@@ -499,12 +552,26 @@ class QuestionableTransformer(nn.Module):
                 (q_idx // bytes_per_latent - kv_idx).abs() \
                     <= self.config.bytelevel_attn_window // (2 * bytes_per_latent),
         )
+
         x = self.embedding(x)
-        for layer in self.encode_layers:
-            x = layer(x)
-        for layer in self.intermediate_layers:
-            x = layer(x)
-        for layer in self.decode_layers:
-            x = layer(x)
+        for layer in self.bytelevel_encode_layers:
+            x = layer(x, seq_positions_bytelevel, attn_mask_bytelevel)
+        x_wide = self.bytelevel_to_latent(
+            x,
+            seq_positions_bytelevel,
+            seq_positions_latent_strided,
+            attn_mask_bytelevel_to_latent
+        )
+        for layer in self.latent_layers:
+            # TODO: we use strided latent positions everywhere now, maybe try the other one too?
+            x_wide = layer(x_wide, seq_positions_latent_strided, attn_mask_latent)
+        x = self.latent_to_bytelevel(
+            x_wide,
+            seq_positions_latent_strided,
+            seq_positions_bytelevel,
+            attn_mask_latent_to_bytelevel
+        )
+        for layer in self.bytelevel_decode_layers:
+            x = layer(x, seq_positions_bytelevel, attn_mask_bytelevel)
         x = self.lm_head(x)
         return x
