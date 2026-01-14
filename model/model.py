@@ -8,6 +8,18 @@ from model.common import ModelConfig
 from model.masking import create_fa_doc_mask, lengths_to_bytelevel, lengths_to_doc_ids, lengths_to_positions
 from model.rotary_encoding import RotaryPositionalEncoding
 
+def fa_ensure_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # flex attention wants 4 dimensions (batch, head, seq, hidden) but we
+    # may use 3 dimensions (head, seq, hidden) due to document masking.
+    # check if this is the case and push a singleton batch dimension.
+    if len(q.shape) == 3:
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        return True, q, k, v
+
+    return False, q, k, v
+
 class FeedforwardGLU(nn.Module):
     "Feedforward layer using GLU"
     def __init__(self, d_hidden: int, d_intermediate: int, activation, bias=True):
@@ -83,10 +95,13 @@ class SelfAttention(nn.Module):
             q = self.rope(q, rope_pos)
             k = self.rope(k, rope_pos)
 
+        need_squeeze, q, k, v = fa_ensure_batch(q, k, v)
         attn_out = fa.flex_attention(
             q, k, v,
             block_mask=attn_block_mask,
         )
+        if need_squeeze:
+            attn_out = attn_out.squeeze(0) # type: ignore
         # shape: (batch, heads, seq, d_qkv)
 
         # transpose and concat
@@ -250,10 +265,13 @@ class ResamplingAttention(nn.Module):
         q = self.rope(q, positions=rope_pos_q)
         k = self.rope(k, positions=rope_pos_k)
 
+        need_squeeze, q, k, v = fa_ensure_batch(q, k, v)
         attn_out = fa.flex_attention(
             q, k, v,
             block_mask=attn_mask,
         )
+        if need_squeeze:
+            attn_out = attn_out.squeeze(0) # type: ignore
         attn_concat = einops.rearrange(
             attn_out,
             '... heads seq d_qkv -> ... seq (heads d_qkv)',
@@ -300,8 +318,8 @@ class HyperconnectionParams(nn.Module):
         combined = dyn_gated + self.static_mapping
         # split into H_pre, H_post, H_res
         h_pre, h_post, h_res = combined.split([1, 1, self.hc_expansion], dim=-2)
-        h_pre = F.sigmoid(h_pre)
-        h_post = 2 * F.sigmoid(h_post)
+        h_pre = F.sigmoid(h_pre).squeeze(-2)
+        h_post = 2 * F.sigmoid(h_post).squeeze(-2)
         h_res = self.sk(h_res)
         return h_pre, h_post, h_res
 
@@ -327,6 +345,7 @@ def hc_apply_post(x_wide: torch.Tensor, layer_out: torch.Tensor, h_post: torch.T
 
 class HcExpand(nn.Module):
     def __init__(self, hc_expansion: int):
+        super().__init__()
         self.hc_expansion = hc_expansion
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -337,6 +356,7 @@ class HcExpand(nn.Module):
 
 class HcMerge(nn.Module):
     def __init__(self, hc_expansion: int):
+        super().__init__()
         self.hc_expansion = hc_expansion
         self.merge_weights = nn.Parameter(torch.ones(hc_expansion))
 
@@ -468,10 +488,10 @@ class LatentToBytelevelBlock(nn.Module):
             config.n_attention_heads,
             rope_latent,
         )
-        self.ff_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.ff_norm = nn.RMSNorm([config.d_hidden_bytelevel], elementwise_affine=True)
         self.feedforward = FeedforwardGLU(
-            config.d_hidden_latent,
-            config.d_intermediate_latent,
+            config.d_hidden_bytelevel,
+            config.d_intermediate_bytelevel,
             config.get_activation(),
         )
 
