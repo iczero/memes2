@@ -1,3 +1,4 @@
+import dataclasses
 import einops
 import torch
 import torch.nn.attention.flex_attention as fa
@@ -505,6 +506,18 @@ class LatentToBytelevelBlock(nn.Module):
         x = x_l + x
         return x
 
+@dataclasses.dataclass
+class SeqInfo:
+    seq_lengths_latent: torch.Tensor
+    seq_lengths_bytelevel: torch.Tensor
+    seq_positions_latent: torch.Tensor
+    seq_positions_latent_strided: torch.Tensor
+    seq_positions_bytelevel: torch.Tensor
+    attn_mask_latent: fa.BlockMask
+    attn_mask_bytelevel: fa.BlockMask
+    attn_mask_bytelevel_to_latent: fa.BlockMask
+    attn_mask_latent_to_bytelevel: fa.BlockMask
+
 class QuestionableTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -535,15 +548,15 @@ class QuestionableTransformer(nn.Module):
         self.lm_head = nn.Linear(config.d_hidden_bytelevel, config.vocab_size_, bias=False)
 
     # note: seq_latent_lengths is latent length (i.e. byte_length // bytes_per_latent)
-    def forward(self, x: torch.Tensor, seq_lengths_latent: torch.Tensor) -> torch.Tensor:
+    def make_seq_info(self, seq_lengths_latent: torch.Tensor, compile = False) -> SeqInfo:
         bytes_per_latent = self.config.bytes_per_latent
         seq_lengths_bytelevel = lengths_to_bytelevel(seq_lengths_latent, bytes_per_latent)
-        #seq_positions_latent = lengths_to_positions(seq_lengths_latent)
+        seq_positions_latent = lengths_to_positions(seq_lengths_latent)
         seq_positions_bytelevel = lengths_to_positions(seq_lengths_bytelevel)
         transition_stride_start = (bytes_per_latent - 1) // 2
         seq_positions_latent_strided = seq_positions_bytelevel[transition_stride_start::bytes_per_latent]
         doc_ids_latent = lengths_to_doc_ids(seq_lengths_latent)
-        attn_mask_latent = create_fa_doc_mask(doc_ids_latent)
+        attn_mask_latent = create_fa_doc_mask(doc_ids_latent, compile=compile)
         attn_mask_bytelevel = create_fa_doc_mask(
             doc_ids_latent,
             bytes_per_latent,
@@ -551,6 +564,7 @@ class QuestionableTransformer(nn.Module):
             kv_is_bytes=True,
             # limit attention to +/- (bytelevel_attn_window / 2) surrounding bytes
             additional_mask=lambda q_idx, kv_idx: (q_idx - kv_idx).abs() <= self.config.bytelevel_attn_window // 2,
+            compile=compile,
         )
         attn_mask_bytelevel_to_latent = create_fa_doc_mask(
             doc_ids_latent,
@@ -561,6 +575,7 @@ class QuestionableTransformer(nn.Module):
             additional_mask=lambda q_idx, kv_idx: \
                 (q_idx - kv_idx // bytes_per_latent).abs() \
                     <= self.config.bytelevel_attn_window // (2 * bytes_per_latent),
+            compile=compile,
         )
         attn_mask_latent_to_bytelevel = create_fa_doc_mask(
             doc_ids_latent,
@@ -571,27 +586,42 @@ class QuestionableTransformer(nn.Module):
             additional_mask=lambda q_idx, kv_idx: \
                 (q_idx // bytes_per_latent - kv_idx).abs() \
                     <= self.config.bytelevel_attn_window // (2 * bytes_per_latent),
+            compile=compile,
         )
 
+        return SeqInfo(
+            seq_lengths_latent,
+            seq_lengths_bytelevel,
+            seq_positions_latent,
+            seq_positions_latent_strided,
+            seq_positions_bytelevel,
+            attn_mask_latent,
+            attn_mask_bytelevel,
+            attn_mask_bytelevel_to_latent,
+            attn_mask_latent_to_bytelevel,
+        )
+
+    def forward(self, x: torch.Tensor, seq_info: SeqInfo) -> torch.Tensor:
+        si = seq_info
         x = self.embedding(x)
         for layer in self.bytelevel_encode_layers:
-            x = layer(x, seq_positions_bytelevel, attn_mask_bytelevel)
+            x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)
         x_wide = self.bytelevel_to_latent(
             x,
-            seq_positions_bytelevel,
-            seq_positions_latent_strided,
-            attn_mask_bytelevel_to_latent
+            si.seq_positions_bytelevel,
+            si.seq_positions_latent_strided,
+            si.attn_mask_bytelevel_to_latent
         )
         for layer in self.latent_layers:
             # TODO: we use strided latent positions everywhere now, maybe try the other one too?
-            x_wide = layer(x_wide, seq_positions_latent_strided, attn_mask_latent)
+            x_wide = layer(x_wide, si.seq_positions_latent_strided, si.attn_mask_latent)
         x = self.latent_to_bytelevel(
             x_wide,
-            seq_positions_latent_strided,
-            seq_positions_bytelevel,
-            attn_mask_latent_to_bytelevel
+            si.seq_positions_latent_strided,
+            si.seq_positions_bytelevel,
+            si.attn_mask_latent_to_bytelevel
         )
         for layer in self.bytelevel_decode_layers:
-            x = layer(x, seq_positions_bytelevel, attn_mask_bytelevel)
+            x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)
         x = self.lm_head(x)
         return x
