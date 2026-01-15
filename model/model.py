@@ -361,7 +361,7 @@ class HcMerge(nn.Module):
     def __init__(self, hc_expansion: int):
         super().__init__()
         self.hc_expansion = hc_expansion
-        self.merge_weights = nn.Parameter(torch.ones(hc_expansion))
+        self.merge_weights = nn.Parameter(torch.full([hc_expansion], 1 / hc_expansion))
 
     def forward(self, x_wide: torch.Tensor) -> torch.Tensor:
         # reshape to 2d form

@@ -1,6 +1,7 @@
 # %%
 import torch
 import torch.nn.functional as F
+from torch import nn
 from model.common import ControlTokens, load_config
 from model.model import QuestionableTransformer, SeqInfo
 
@@ -41,7 +42,7 @@ def compiled_forward(
         model_out.transpose(-2, -1).unsqueeze(0),
         expected_output.unsqueeze(0),
         reduction='none',
-    )
+    ).squeeze(0)
 
     loss_masked = torch.where(output_mask, loss_all, 0)
     loss = loss_masked.sum() / output_mask.sum()
@@ -64,6 +65,7 @@ def train_step(
         assert seq_input.shape == output_mask.shape
         assert output_mask.dtype == torch.bool
 
+    optimizer.zero_grad(set_to_none=True)
     seq_info = model.make_seq_info(seq_latent_lens, compile=not DISABLE_COMPILE)
     loss, sampled_out = compiled_forward(
         seq_input,
@@ -75,7 +77,6 @@ def train_step(
 
     loss.backward()
     torch.compile(disable=DISABLE_COMPILE)(optimizer.step)()
-    optimizer.zero_grad(set_to_none=True)
 
     return loss_detached, sampled_out
 
@@ -86,9 +87,11 @@ def bytes_to_tokens(bstr: bytes, prepend_sot = True) -> torch.Tensor:
         sot = []
     return torch.tensor(sot + list(bstr), dtype=torch.int32, device='cpu')
 
-def tokens_to_printable_bytes(tokens: torch.Tensor) -> bytes:
+def tokens_to_printable_bytes(tokens: torch.Tensor | list[int]) -> bytes:
     out = []
-    for value in tokens.tolist():
+    if isinstance(tokens, torch.Tensor):
+        tokens = tokens.tolist()
+    for value in tokens:
         if value <= 255:
             out.append(bytes([value]))
         elif value == ControlTokens.PAD:
@@ -107,6 +110,7 @@ def tokens_to_printable_bytes(tokens: torch.Tensor) -> bytes:
 # begin memes
 
 import random
+import itertools
 
 FIZZ = 3
 BUZZ = 5
@@ -196,8 +200,28 @@ def train_for_iter(n: int, sample_interval = 16, seq_len = 4096):
             seq_lens.to(device),
         )
         print(f'iter {i}\n  loss', loss.item())
+        # TODO: fix
+        #grad_norm = nn.utils.clip_grad_norm_(model.parameters(), torch.inf, error_if_nonfinite=True)
+        #print('  grad norm: ', grad_norm)
         if i > 0 and i % sample_interval == 0:
-            sample_expected = out_seq[out_mask]
-            sample_predicted = sample[out_mask]
-            print('  expected:  ' + repr(tokens_to_printable_bytes(sample_expected)))
-            print('  predicted: ' + repr(tokens_to_printable_bytes(sample_predicted)))
+            sample_expected = out_seq[out_mask].tolist()
+            sample_predicted = sample[out_mask].tolist()
+            expected_iter = itertools.batched(sample_expected, 8)
+            predicted_iter = itertools.batched(sample_predicted, 8)
+            lines = itertools.batched(
+                zip(
+                    (tokens_to_printable_bytes(list(seg)) for seg in expected_iter),
+                    (tokens_to_printable_bytes(list(seg)) for seg in predicted_iter),
+                ),
+                16,
+            )
+            for line in lines:
+                exp_line = ['  expected: ']
+                pred_line = ['  predicted:']
+                for exp, pred in line:
+                    exp_line.append(repr(exp.decode(errors='replace')))
+                    pred_line.append(repr(pred.decode(errors='replace')))
+
+                print()
+                print(' '.join(exp_line))
+                print(' '.join(pred_line))
