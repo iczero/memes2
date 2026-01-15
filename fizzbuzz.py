@@ -18,8 +18,8 @@ train_config = combined_config.train_config
 device = torch.device('cuda')
 torch.set_float32_matmul_precision('high')
 model_dtype = torch.float32
+token_dtype = torch.long
 
-model_config = load_config('configs/test.json').model_config
 model = QuestionableTransformer(model_config)
 model = model.to(device=device, dtype=model_dtype)
 
@@ -85,7 +85,7 @@ def bytes_to_tokens(bstr: bytes, prepend_sot = True) -> torch.Tensor:
         sot = [ControlTokens.START_OF_TEXT]
     else:
         sot = []
-    return torch.tensor(sot + list(bstr), dtype=torch.int32, device='cpu')
+    return torch.tensor(sot + list(bstr), dtype=token_dtype, device='cpu')
 
 def tokens_to_printable_bytes(tokens: torch.Tensor | list[int]) -> bytes:
     out = []
@@ -119,18 +119,17 @@ DIGITS = {
     '0': b'zero', '1': b'one', '2': b'two', '3': b'three', '4': b'four',
     '5': b'five', '6': b'six', '7': b'seven', '8': b'eight', '9': b'nine',
 }
-def make_fizzbuzz(target_seq_len: int):
-    # 8-digit fizzbuzz generator
-    MIN = 10_000_000
-    MAX = 99_999_999
+def make_fizzbuzz(lower: int, upper: int, target_seq_len: int):
+    if ENABLE_ASSERTIONS:
+        assert upper <= 99_999_999
 
     total_len = 0
     in_seqs = []
     out_seqs = []
     out_masks = []
     while total_len < target_seq_len:
-        num = random.randint(MIN, MAX)
-        num_str = str(num)
+        num = random.randint(lower, upper)
+        num_str = str(num).rjust(8, '0')
         num_exploded = b' '.join(DIGITS[d] for d in num_str)
 
         if num % (FIZZ * BUZZ) == 0:
@@ -141,9 +140,6 @@ def make_fizzbuzz(target_seq_len: int):
             fizzbuzz_out = b'    buzz'
         else:
             fizzbuzz_out = num_str.encode('ascii')
-
-        if ENABLE_ASSERTIONS:
-            assert len(fizzbuzz_out) == 8
 
         common = bytes_to_tokens(num_exploded + b' -> ', True)
         seq_len = common.shape[0] + 8
@@ -175,7 +171,7 @@ def make_fizzbuzz(target_seq_len: int):
         out_masks.append(out_mask)
 
     end_padding_len = target_seq_len - total_len
-    end_padding = torch.tensor([ControlTokens.PAD] * end_padding_len, dtype=torch.int32, device='cpu')
+    end_padding = torch.tensor([ControlTokens.PAD] * end_padding_len, dtype=token_dtype, device='cpu')
     end_padding_mask = torch.tensor([False] * end_padding_len, dtype=torch.bool, device='cpu')
 
     in_seq = torch.concat(in_seqs + [end_padding])
@@ -186,24 +182,26 @@ def make_fizzbuzz(target_seq_len: int):
     if end_padding_len > 0:
         seq_lens.append(end_padding_len // 4)
 
-    seq_lens = torch.tensor(seq_lens, device='cpu', dtype=torch.int32)
+    seq_lens = torch.tensor(seq_lens, device='cpu', dtype=token_dtype)
 
     return in_seq, out_seq, out_mask, seq_lens
 
-def train_for_iter(n: int, sample_interval = 16, seq_len = 4096):
+def train_for_iter(n: int, lower: int, upper: int, sample_interval = 64, seq_len = 4096):
     for i in range(n):
-        in_seq, out_seq, out_mask, seq_lens = make_fizzbuzz(seq_len)
+        in_seq, out_seq, out_mask, seq_lens = make_fizzbuzz(lower, upper, seq_len)
         loss, sample = train_step(
             in_seq.to(device),
             out_seq.to(device),
             out_mask.to(device),
             seq_lens.to(device),
         )
-        print(f'iter {i}\n  loss', loss.item())
-        # TODO: fix
-        #grad_norm = nn.utils.clip_grad_norm_(model.parameters(), torch.inf, error_if_nonfinite=True)
-        #print('  grad norm: ', grad_norm)
+        print(f'iter {i}  loss', loss.item())
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), torch.inf, error_if_nonfinite=True)
+        print('  grad norm: ', grad_norm.item())
         if i > 0 and i % sample_interval == 0:
+            total_count = 0
+            correct_count = 0
+
             sample_expected = out_seq[out_mask].tolist()
             sample_predicted = sample[out_mask].tolist()
             expected_iter = itertools.batched(sample_expected, 8)
@@ -222,6 +220,21 @@ def train_for_iter(n: int, sample_interval = 16, seq_len = 4096):
                     exp_line.append(repr(exp.decode(errors='replace')))
                     pred_line.append(repr(pred.decode(errors='replace')))
 
+                    total_count += 1
+                    if exp == pred:
+                        correct_count += 1
+
                 print()
                 print(' '.join(exp_line))
                 print(' '.join(pred_line))
+
+            acc_pct = (correct_count / total_count * 100)
+            print(f'  accuracy: {correct_count} / {total_count} ({acc_pct:.2f}%)')
+
+def main():
+    train_for_iter(768, lower=100, upper=    10_000, seq_len=32768)
+    train_for_iter(128, lower=100,  upper= 1_000_000, seq_len=32768)
+    train_for_iter(256, lower=100,  upper=99_999_999, seq_len=32768)
+
+if __name__ == '__main__' and not hasattr(__builtins__, '__IPYTHON__'):
+    main()

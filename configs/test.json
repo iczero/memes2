@@ -14,7 +14,7 @@
     "qkv_bias": true
   },
   "train_config": {
-    "lr": 1e-4,
+    "lr": 3e-5,
     "weight_decay": 0.05,
     "batch_size": 32,
     "accumulate_gradients": 1,

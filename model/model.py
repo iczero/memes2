@@ -300,7 +300,13 @@ class HyperconnectionParams(nn.Module):
         )
         self.gating_pre_post = nn.Parameter(torch.tensor([hc_gating_init] * 2))
         self.gating_res = nn.Parameter(torch.tensor([hc_gating_init]))
-        self.static_mapping = nn.Parameter(torch.zeros((2 + hc_expansion, hc_expansion)))
+        self.static_mapping = nn.Parameter(
+            torch.cat([
+                torch.ones((2, hc_expansion)),
+                torch.eye(hc_expansion),
+            ], dim=0)
+        )
+
         self.sk = SinkhornKnopp(sk_iters)
 
     def _combine_gating(self) -> torch.Tensor:
@@ -606,23 +612,30 @@ class QuestionableTransformer(nn.Module):
     def forward(self, x: torch.Tensor, seq_info: SeqInfo) -> torch.Tensor:
         si = seq_info
         x = self.embedding(x)
+
         for layer in self.bytelevel_encode_layers:
             x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)
-        x_wide = self.bytelevel_to_latent(
-            x,
-            si.seq_positions_bytelevel,
-            si.seq_positions_latent_strided,
-            si.attn_mask_bytelevel_to_latent
-        )
+
+        if len(self.latent_layers) > 0:
+            x_wide = self.bytelevel_to_latent(
+                x,
+                si.seq_positions_bytelevel,
+                si.seq_positions_latent_strided,
+                si.attn_mask_bytelevel_to_latent
+            )
+
         for layer in self.latent_layers:
             # TODO: we use strided latent positions everywhere now, maybe try the other one too?
             x_wide = layer(x_wide, si.seq_positions_latent_strided, si.attn_mask_latent)
-        x = self.latent_to_bytelevel(
-            x_wide,
-            si.seq_positions_latent_strided,
-            si.seq_positions_bytelevel,
-            si.attn_mask_latent_to_bytelevel
-        )
+
+        if len(self.latent_layers) > 0:
+            x = self.latent_to_bytelevel(
+                x_wide,
+                si.seq_positions_latent_strided,
+                si.seq_positions_bytelevel,
+                si.attn_mask_latent_to_bytelevel
+            )
+
         for layer in self.bytelevel_decode_layers:
             x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)
         x = self.lm_head(x)
