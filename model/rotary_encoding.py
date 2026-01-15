@@ -29,6 +29,7 @@ class RotaryPositionalEncoding(nn.Module):
         # a2: cos(m*t) * a + sin(m*t) * -b
         # b2: sin(m*t) * a + cos(m*t) *  b
 
+        dtype = x.dtype
         # in: (batch..., seq, n_embed)
         a = x[..., 0::2]
         b = x[..., 1::2]
@@ -38,8 +39,8 @@ class RotaryPositionalEncoding(nn.Module):
         else:
             cos_resized = self.cos_cached.narrow(-2, 0, a.shape[-2])
             sin_resized = self.sin_cached.narrow(-2, 0, a.shape[-2])
-        a2 = cos_resized * a + sin_resized * -b
-        b2 = sin_resized * a + cos_resized * b
+        a2 = (cos_resized * a + sin_resized * -b).to(dtype=dtype)
+        b2 = (sin_resized * a + cos_resized * b).to(dtype=dtype)
         return torch.stack((a2, b2), dim=-1).flatten(-2, -1)
 
     def d_hidden(self):

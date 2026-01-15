@@ -9,6 +9,8 @@ from model.common import ModelConfig
 from model.masking import create_fa_doc_mask, lengths_to_bytelevel, lengths_to_doc_ids, lengths_to_positions
 from model.rotary_encoding import RotaryPositionalEncoding
 
+LayerNormImpl = nn.RMSNorm
+
 def fa_ensure_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor]:
     # flex attention wants 4 dimensions (batch, head, seq, hidden) but we
     # may use 3 dimensions (head, seq, hidden) due to document masking.
@@ -210,7 +212,7 @@ class ResamplingAttention(nn.Module):
         self.d_hidden_in_reshape = d_hidden_in_reshape
         self.n_attention_heads = n_attention_heads
 
-        self.pre_norm = nn.RMSNorm([d_hidden_in], elementwise_affine=True)
+        self.pre_norm = LayerNormImpl([d_hidden_in], elementwise_affine=True)
 
         # query: byte -> concat -> w_q -> sdpa
         self.w_q = nn.Linear(
@@ -290,7 +292,7 @@ class HyperconnectionParams(nn.Module):
         self.d_hidden = d_hidden
         self.hc_expansion = hc_expansion
 
-        self.norm = nn.RMSNorm([self.hc_expansion * self.d_hidden])
+        self.norm = LayerNormImpl([self.hc_expansion * self.d_hidden])
         self.dynamic_proj = nn.Linear(
             d_hidden * hc_expansion,
             hc_expansion * (2 + hc_expansion),
@@ -372,7 +374,7 @@ class HcMerge(nn.Module):
 class BytelevelBlock(nn.Module):
     def __init__(self, config: ModelConfig, rope_bytelevel: RotaryPositionalEncoding):
         super().__init__()
-        self.attn_norm = nn.RMSNorm([config.d_hidden_bytelevel], elementwise_affine=True)
+        self.attn_norm = LayerNormImpl([config.d_hidden_bytelevel], elementwise_affine=True)
         self.attention = SelfAttention(
             config.d_hidden_bytelevel,
             config.d_qkv_bytelevel,
@@ -380,7 +382,7 @@ class BytelevelBlock(nn.Module):
             rope_bytelevel,
             config.qkv_bias,
         )
-        self.ff_norm = nn.RMSNorm([config.d_hidden_bytelevel], elementwise_affine=True)
+        self.ff_norm = LayerNormImpl([config.d_hidden_bytelevel], elementwise_affine=True)
         self.feedforward = FeedforwardGLU(
             config.d_hidden_bytelevel,
             config.d_intermediate_bytelevel,
@@ -405,7 +407,7 @@ class LatentBlock(nn.Module):
             config.hc_gating_init,
             config.hc_sk_iters
         )
-        self.attn_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.attn_norm = LayerNormImpl([config.d_hidden_latent], elementwise_affine=True)
         self.attention = SelfAttention(
             config.d_hidden_latent,
             config.d_qkv_latent,
@@ -419,7 +421,7 @@ class LatentBlock(nn.Module):
             config.hc_gating_init,
             config.hc_sk_iters
         )
-        self.ff_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.ff_norm = LayerNormImpl([config.d_hidden_latent], elementwise_affine=True)
         self.feedforward = FeedforwardGLU(
             config.d_hidden_latent,
             config.d_intermediate_latent,
@@ -458,7 +460,7 @@ class BytelevelToLatentBlock(nn.Module):
             config.hc_gating_init,
             config.hc_sk_iters
         )
-        self.ff_norm = nn.RMSNorm([config.d_hidden_latent], elementwise_affine=True)
+        self.ff_norm = LayerNormImpl([config.d_hidden_latent], elementwise_affine=True)
         self.feedforward = FeedforwardGLU(
             config.d_hidden_latent,
             config.d_intermediate_latent,
@@ -489,7 +491,7 @@ class LatentToBytelevelBlock(nn.Module):
             config.n_attention_heads,
             rope_latent,
         )
-        self.ff_norm = nn.RMSNorm([config.d_hidden_bytelevel], elementwise_affine=True)
+        self.ff_norm = LayerNormImpl([config.d_hidden_bytelevel], elementwise_affine=True)
         self.feedforward = FeedforwardGLU(
             config.d_hidden_bytelevel,
             config.d_intermediate_bytelevel,
