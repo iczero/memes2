@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 import dataclasses
 import enum
 import json
@@ -6,6 +7,7 @@ import typing
 
 import torch
 from torch import nn
+from torch._functorch.config import activation_memory_budget
 
 @enum.verify(enum.CONTINUOUS)
 class ControlTokens(enum.IntEnum):
@@ -19,10 +21,10 @@ class ControlTokens(enum.IntEnum):
     END_OF_TEXT = 259
     "End of text token"
 
-    UNUSED_4 = 260
-    UNUSED_5 = 261
-    UNUSED_6 = 262
-    UNUSED_7 = 263
+    BEGIN_SECTION = 260
+    END_SECTION = 261
+    KEY = 262
+    VALUE = 263
 
 def dataclass_from_dict(cls, obj: dict[str, typing.Any]):
     annotations = cls.__annotations__
@@ -123,12 +125,14 @@ class TrainConfig:
     "Learning rate"
     weight_decay: float
     "Weight decay"
-    batch_size: int
-    "Batch size"
-    accumulate_gradients: int
-    "How many batches to run before running the optimizer step"
     optimizer: str
     "Optimizer to use"
+    full_seq_len: int
+    """
+    Full length of the model input sequence. This may include multiple sequences
+    packed together. Changing this will require re-compiling the model forward
+    and backward passes.
+    """
 
     @classmethod
     def from_dict(cls, obj: dict) -> Self:
@@ -137,40 +141,6 @@ class TrainConfig:
     def to_dict(self):
         return dataclasses.asdict(self)
 
-    def make_param_groups(self, named_parameters):
-        exclude_wd = []
-        default = []
-        for name, param in named_parameters:
-            if len(param.shape) < 2 \
-                    or name.endswith('.bias') \
-                    or name.endswith('.positional_encodings'):
-                exclude_wd.append(param)
-            else:
-                default.append(param)
-
-        return [
-            { 'params': exclude_wd, 'weight_decay': 0.0 },
-            { 'params': default },
-        ]
-
-    def make_optimizer(self, named_parameters, allow_fused=False):
-        groups = self.make_param_groups(named_parameters)
-        if self.optimizer == 'AdamW':
-            return torch.optim.AdamW(
-                groups,
-                self.lr,
-                weight_decay=self.weight_decay,
-                fused=allow_fused,
-            )
-
-        if self.optimizer == 'SGD':
-            return torch.optim.SGD(
-                groups,
-                self.lr,
-                weight_decay=self.weight_decay,
-            )
-
-        raise RuntimeError('unknown optimizer ' + self.optimizer)
 
 @dataclasses.dataclass
 class CombinedConfig:
@@ -181,9 +151,72 @@ class CombinedConfig:
     def from_dict(cls, obj) -> Self:
         return dataclass_from_dict(cls, obj)
 
+    def __post_init__(self):
+        if self.train_config.full_seq_len % self.model_config.bytes_per_latent != 0:
+            raise ValueError('full_seq_len must be a multiple of bytes_per_latent')
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
 def load_config(path: str):
     with open(path, 'r') as f:
         return CombinedConfig.from_dict(json.load(f))
+
+def make_tokens(*parts: bytes | int | ControlTokens | Sequence[bytes | int | ControlTokens]):
+    out: list[int] = []
+    for part in parts:
+        match part:
+            case ControlTokens() as token:
+                out.append(token.value)
+            case int() as token:
+                out.append(token)
+            case bytes() as bytestr:
+                out.extend(bytestr)
+            case Sequence() as inner_list:
+                # there's probably a better way to do this, but whatever
+                for part in inner_list:
+                    match part:
+                        case ControlTokens() as token:
+                            out.append(token.value)
+                        case int() as token:
+                            out.append(token)
+                        case bytes() as bytestr:
+                            out.extend(bytestr)
+
+    return torch.tensor(out, device='cpu', dtype=torch.int32)
+
+
+def tokens_repr(tokens: torch.Tensor | list[int]) -> bytes:
+    out = []
+    if isinstance(tokens, torch.Tensor):
+        tokens = tokens.tolist()
+    for value in tokens:
+        match value:
+            case b if b < 256:
+                out.append(bytes([value]))
+            case ControlTokens.PAD:
+                out.append(b'<|pad|>')
+            case ControlTokens.MASK:
+                out.append(b'<|mask|>')
+            case ControlTokens.START_OF_TEXT:
+                out.append(b'<|startoftext|>')
+            case ControlTokens.END_OF_TEXT:
+                out.append(b'<|endoftext|>')
+            case ControlTokens.BEGIN_SECTION:
+                out.append(b'<|beginsection|>')
+            case ControlTokens.END_SECTION:
+                out.append(b'<|endsection|>')
+            case ControlTokens.KEY:
+                out.append(b'<|key|>')
+            case ControlTokens.VALUE:
+                out.append(b'<|value|>')
+            case other:
+                out.append(b'<|?' + str(other).encode('ascii') + b'?|>')
+
+    return b''.join(out)
+
+def padding_needed(current_length: int, chunk_length: int) -> int:
+    if current_length % chunk_length == 0:
+        return 0
+
+    return chunk_length - (current_length % chunk_length)

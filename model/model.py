@@ -616,25 +616,23 @@ class QuestionableTransformer(nn.Module):
         for layer in self.bytelevel_encode_layers:
             x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)
 
-        if len(self.latent_layers) > 0:
-            x_wide = self.bytelevel_to_latent(
-                x,
-                si.seq_positions_bytelevel,
-                si.seq_positions_latent_strided,
-                si.attn_mask_bytelevel_to_latent
-            )
+        x_wide = self.bytelevel_to_latent(
+            x,
+            si.seq_positions_bytelevel,
+            si.seq_positions_latent_strided,
+            si.attn_mask_bytelevel_to_latent
+        )
 
         for layer in self.latent_layers:
             # TODO: we use strided latent positions everywhere now, maybe try the other one too?
             x_wide = layer(x_wide, si.seq_positions_latent_strided, si.attn_mask_latent)
 
-        if len(self.latent_layers) > 0:
-            x = self.latent_to_bytelevel(
-                x_wide,
-                si.seq_positions_latent_strided,
-                si.seq_positions_bytelevel,
-                si.attn_mask_latent_to_bytelevel
-            )
+        x = self.latent_to_bytelevel(
+            x_wide,
+            si.seq_positions_latent_strided,
+            si.seq_positions_bytelevel,
+            si.attn_mask_latent_to_bytelevel
+        )
 
         for layer in self.bytelevel_decode_layers:
             x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)

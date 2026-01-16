@@ -13,13 +13,14 @@ class RotaryPositionalEncoding(nn.Module):
     cos_cached: Tensor
     sin_cached: Tensor
 
-    def __init__(self, d_hidden: int, seq_len: int, base = 50000):
+    def __init__(self, d_hidden: int, seq_len: int, base = 50000, device: torch.device | None = None):
         super().__init__()
         assert d_hidden % 2 == 0
         # compute coefficients at full precision
-        dim_idx = torch.arange(0, d_hidden, 2, dtype=torch.float64)
+        dim_idx = torch.arange(0, d_hidden, 2, dtype=torch.float64, device=device)
         theta = base ** (-dim_idx / d_hidden)
-        base = theta.unsqueeze(0) * torch.arange(seq_len).type_as(theta).unsqueeze(-1)
+        base = theta.unsqueeze(0) * torch.arange(seq_len, device=device) \
+            .type_as(theta).unsqueeze(-1)
         self.register_buffer('sin_cached', base.sin(), persistent=False)
         self.register_buffer('cos_cached', base.cos(), persistent=False)
 

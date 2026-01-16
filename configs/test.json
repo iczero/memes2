@@ -16,8 +16,7 @@
   "train_config": {
     "lr": 3e-5,
     "weight_decay": 0.05,
-    "batch_size": 32,
-    "accumulate_gradients": 1,
+    "full_seq_len": 32768,
     "optimizer": "AdamW"
   }
 }
