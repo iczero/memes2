@@ -25,20 +25,23 @@ class ControlTokens(enum.IntEnum):
     KEY = 262
     VALUE = 263
 
-def dataclass_from_dict(cls, obj: dict[str, typing.Any]):
+def dataclass_from_dict(cls, obj: dict[str, typing.Any], ignore_nonconfigurable = False):
     annotations = cls.__annotations__
     validated = {}
     for k, v in obj.items():
         if k not in annotations:
             raise ValueError(f'unexpected key {repr(k)}')
         if k.endswith('_'):
-            raise ValueError(f'encountered non-configurable key {repr(k)}')
+            if not ignore_nonconfigurable:
+                raise ValueError(f'encountered non-configurable key {repr(k)}')
+
+            continue
 
         wanted_type = annotations[k]
         if wanted_type in (int, float, str, bool):
             validated[k] = wanted_type(v)
         else:
-            validated[k] = dataclass_from_dict(wanted_type, v)
+            validated[k] = dataclass_from_dict(wanted_type, v, ignore_nonconfigurable=ignore_nonconfigurable)
 
     return cls(**validated)
 
@@ -86,8 +89,8 @@ class ModelConfig:
     "Vocabulary size, not read from config"
 
     @classmethod
-    def from_dict(cls, obj: dict) -> Self:
-        return dataclass_from_dict(cls, obj)
+    def from_dict(cls, obj: dict, ignore_nonconfigurable = False) -> Self:
+        return dataclass_from_dict(cls, obj, ignore_nonconfigurable=ignore_nonconfigurable)
 
     # defaults
     def __post_init__(self):
@@ -136,8 +139,8 @@ class TrainConfig:
     """
 
     @classmethod
-    def from_dict(cls, obj: dict) -> Self:
-        return dataclass_from_dict(cls, obj)
+    def from_dict(cls, obj: dict, ignore_nonconfigurable = False) -> Self:
+        return dataclass_from_dict(cls, obj, ignore_nonconfigurable=ignore_nonconfigurable)
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -149,8 +152,8 @@ class CombinedConfig:
     train_config: TrainConfig
 
     @classmethod
-    def from_dict(cls, obj) -> Self:
-        return dataclass_from_dict(cls, obj)
+    def from_dict(cls, obj: dict, ignore_nonconfigurable = False) -> Self:
+        return dataclass_from_dict(cls, obj, ignore_nonconfigurable=ignore_nonconfigurable)
 
     def __post_init__(self):
         if self.train_config.full_seq_len % self.model_config.bytes_per_latent != 0:

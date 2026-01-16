@@ -2,6 +2,7 @@ import typing
 import argparse
 import mlflow
 import signal
+import sys
 import time
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ from torch import nn
 from model.common import ControlTokens, load_config, make_tokens, tokens_repr
 from model.pile_loader import filter_text, load_dataset
 from model.train import Trainer
+from pathlib import Path
 
 import torch._functorch.config
 torch._functorch.config.activation_memory_budget = 0.5
@@ -18,10 +20,13 @@ mlflow.config.enable_async_logging()
 mlflow.set_tracking_uri('http://127.0.0.1:5000')
 
 arg_parser = argparse.ArgumentParser()
-arg_parser.add_argument('config', help='path to config')
-arg_parser.add_argument('data', help='path to dataset')
+arg_parser.add_argument('--config', type=str, help='path to config', default=None)
+arg_parser.add_argument('--data', type=str, help='path to dataset', required=True)
 arg_parser.add_argument('--no-compile', action='store_true', help='disable torch.compile')
 arg_parser.add_argument('--use-cpu', action='store_true', help='use cpu instead of cuda')
+start_or_load = arg_parser.add_mutually_exclusive_group(required=True)
+start_or_load.add_argument('--new', type=str, help='start new run in provided checkpoint directory', default=None)
+start_or_load.add_argument('--load', type=str, help='load checkpoint file and continue', default=None)
 
 # thanks gemini
 def span_mask(
@@ -86,10 +91,63 @@ def main():
     if args.use_cpu:
         device = torch.device('cpu')
 
+    if args.new is not None:
+        if args.config is None:
+            print('error: config required when starting new run')
+            sys.exit(1)
+
+        checkpoint_dir = Path(args.new)
+
+        combined_config = load_config(args.config)
+        mlflow_ctxmgr = mlflow.start_run(run_name=checkpoint_dir.name)
+        trainer = Trainer(combined_config, device=device, checkpoint_dir=checkpoint_dir)
+    elif args.load is not None:
+        replace_config = None
+        if args.config is not None:
+            print('info: config provided with load, replacing config!')
+            replace_config = load_config(args.config)
+        checkpoint_path = Path(args.load)
+
+        trainer, run_id = Trainer.load_checkpoint(checkpoint_path, device, replace_config=replace_config)
+        mlflow_ctxmgr = mlflow.start_run(run_id=run_id)
+    else:
+        raise RuntimeError('required option missing')
+
+    if args.no_compile:
+        print('disabling torch.compile')
+        trainer.enable_compile = False
+
+    model_config = trainer.model_config
+    train_config = trainer.train_config
+
+    print(f'model parameter count: {sum(p.numel() for p in trainer.model.parameters()):n}')
+
+    data_iter = filter_text(load_dataset(open(args.data, 'rb')))
+
+    def make_one_seq():
+        text = next(data_iter, None)
+        if text is None:
+            print('data exhausted!')
+            return None
+
+        # TODO: make this less garbage
+        max_len = train_config.full_seq_len - 2
+        out_seq = make_tokens(
+            ControlTokens.START_OF_TEXT,
+            text.encode()[:max_len],
+            ControlTokens.END_OF_TEXT,
+        )
+
+        in_masked, out_mask = span_mask(out_seq)
+
+        stacked = torch.stack([in_masked, out_seq], dim=0)
+
+        return stacked, out_mask
+
     go_away = typing.cast(bool, False) # needed for ty for some reason
     save_now = typing.cast(bool, False)
 
-    def signal_handler(sig, frame):
+    def signal_handler(sig, _frame):
         nonlocal go_away, save_now
         if sig == signal.SIGINT:
             if go_away:
@@ -99,63 +157,34 @@ def main():
             go_away = True
             print('exiting soon')
         elif sig == signal.SIGUSR1:
+            print('queued checkpoint')
             save_now = True
+        elif sig == signal.SIGQUIT:
+            # ^\ (ctrl-backslash) sends this usually
+            print('SIGQUIT received, exiting immediately')
+            raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGUSR1, signal_handler)
+    signal.signal(signal.SIGQUIT, signal_handler)
 
-    def save_checkpoint():
-        to_save = trainer.state_dict()
-        to_save['step'] = step
-        # TODO: better
-        out_path = f'checkpoints/{int(time.time())}.pt'
-        torch.save(to_save, out_path)
-        print('saved checkpoint to', out_path)
-
-    with mlflow.start_run():
-        combined_config = load_config(args.config)
-        trainer = Trainer(combined_config, device=device)
-        model_config = trainer.model_config
-        train_config = trainer.train_config
-
-        if args.no_compile:
-            print('disabling torch.compile')
-            trainer.enable_compile = False
-
-        data_iter = filter_text(load_dataset(open(args.data, 'rb')))
-
-        print('parameters:', sum(p.numel() for p in trainer.model.parameters()))
-
-        def make_one_seq():
-            text = next(data_iter, None)
-            if text is None:
-                print('data exhausted!')
-                return None
-
-            # TODO: make this less garbage
-            max_len = train_config.full_seq_len - 2
-            out_seq = make_tokens(
-                ControlTokens.START_OF_TEXT,
-                text.encode()[:max_len],
-                ControlTokens.END_OF_TEXT,
-            )
-
-            in_masked, out_mask = span_mask(out_seq)
-
-            stacked = torch.stack([in_masked, out_seq], dim=0)
-
-            return stacked, out_mask
-
-        step = 0
+    with mlflow_ctxmgr:
         while not go_away:
             raw_len = 0
             seqs = []
             masks = []
             while raw_len < train_config.full_seq_len:
-                seq, mask = make_one_seq()
+                next_seq = make_one_seq()
+                if next_seq is None:
+                    break
+                seq, mask = next_seq
                 seqs.append(seq)
                 masks.append(mask)
                 raw_len += len(mask)
+
+            if len(seqs) == 0:
+                print('no more sequences available, exiting')
+                break
 
             seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seqs, masks)
             if seq_count == 0:
@@ -167,7 +196,6 @@ def main():
 
             in_masked = packed[0]
             out_seq = packed[1]
-            # TODO: enable_compile
             seq_info = trainer.model.make_seq_info(seq_lengths, compile=trainer.enable_compile)
 
             trainer.zero_grad()
@@ -180,19 +208,20 @@ def main():
                 'loss': loss.item(),
                 'grad_norm': grad_norm.item(),
                 'seq_count': seq_count,
-            }, step=step)
+            }, step=trainer.step)
 
-            print(f'step {step}: loss {loss.item()}, grad norm {grad_norm.item()}')
-            if step % 64 == 0 and step > 0:
-                print('sample output:', tokens_repr(sample))
+            print(f'step {trainer.step}: loss {loss.item()}, grad norm {grad_norm.item()}')
+            if trainer.step % 64 == 0 and trainer.step > 0:
+                print('sample output:  ', tokens_repr(sample[out_mask]))
+                print('sample expected:', tokens_repr(out_seq[out_mask]))
 
-            step += 1
+            trainer.step += 1
 
             if save_now:
                 save_now = False
-                save_checkpoint()
+                trainer.save_checkpoint()
 
-        save_checkpoint()
+        trainer.save_checkpoint()
 
 if __name__ == '__main__' and not hasattr(__builtins__, '__IPYTHON__'):
     main()

@@ -1,10 +1,13 @@
+import time
 import typing
 import mlflow
 import torch
 import torch.nn.functional as F
 from torch import nn
-from model.common import CombinedConfig, ControlTokens, ModelConfig, TrainConfig, load_config, make_tokens, padding_needed
+from typing import Self
+from model.common import CombinedConfig, ControlTokens, ModelConfig, TrainConfig, make_tokens, padding_needed
 from model.model import QuestionableTransformer, SeqInfo
+from pathlib import Path
 
 import torch._functorch.config
 torch._functorch.config.activation_memory_budget = 0.5
@@ -29,16 +32,21 @@ class Trainer:
     use_mlflow: bool
     "True if we should log to mlflow"
 
+    step: int = 0
+    checkpoint_dir: Path
+
     def __init__(
         self,
         config: CombinedConfig,
         device: torch.device,
+        checkpoint_dir: Path,
         model_dtype: torch.dtype | None = None,
         _restoring: bool = False,
     ):
         self.model_config = config.model_config
         self.train_config = config.train_config
         self.device = device
+        self.checkpoint_dir = checkpoint_dir
 
         if model_dtype is not None:
             self.model_dtype = model_dtype
@@ -261,13 +269,54 @@ class Trainer:
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'config': CombinedConfig(self.model_config, self.train_config).to_dict(),
+            'step': self.step,
         }
         if USE_MLFLOW:
             out['run_id'] = mlflow.active_run().info.run_id
         return out
 
     @classmethod
-    def load_state_dict(cls, state, device: torch.device):
-        inst = cls(state['config'], device=device, _restoring=True)
+    def load_state_dict(
+            cls,
+            state,
+            device: torch.device,
+            checkpoint_dir: Path,
+            replace_config: CombinedConfig | None = None,
+    ) -> Self:
+        if replace_config is not None:
+            combined_config = replace_config
+        else:
+            combined_config = CombinedConfig.from_dict(state['config'], ignore_nonconfigurable=True)
+        inst = cls(combined_config, device=device, checkpoint_dir=checkpoint_dir, _restoring=True)
+        inst.step = state['step']
         inst.model.load_state_dict(state['model'])
         inst.optimizer.load_state_dict(state['optimizer'])
+        return inst
+
+    def save_checkpoint(self, additional: dict | None = None):
+        state = self.state_dict()
+        if additional is not None:
+            for k, v in additional.items():
+                state[k] = v
+
+        out_name = f'step{self.step:07d}-{int(time.time())}.pt'
+        with open(self.checkpoint_dir / out_name, 'wb') as f:
+            torch.save(state, f)
+
+        print(f'saved checkpoint {out_name}')
+
+    @classmethod
+    def load_checkpoint(
+            cls,
+            checkpoint_path: Path,
+            device: torch.device,
+            replace_config: CombinedConfig | None = None,
+    ) -> tuple[Self, str]:
+        checkpoint_dir = checkpoint_path.absolute().parent
+        with open(checkpoint_path, 'rb') as f:
+            state = torch.load(f, map_location='cpu')
+
+        run_id = state.get('run_id', None)
+        inst = cls.load_state_dict(state, device, checkpoint_dir, replace_config=replace_config)
+        return inst, run_id
+

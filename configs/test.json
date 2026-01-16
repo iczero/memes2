@@ -1,23 +1,23 @@
 {
   "model_config": {
-    "n_attention_heads": 8,
-    "d_hidden_latent": 512,
-    "d_hidden_bytelevel": 128,
+    "n_attention_heads": 12,
+    "d_hidden_latent": 768,
+    "d_hidden_bytelevel": 192,
     "d_qkv_bytelevel": 32,
     "bytes_per_latent": 4,
     "bytelevel_attn_window": 128,
-    "n_bytelevel_encode_layers": 1,
+    "n_bytelevel_encode_layers": 2,
     "n_bytelevel_decode_layers": 1,
-    "n_latent_layers": 6,
+    "n_latent_layers": 7,
     "hc_expansion": 4,
     "activation": "silu",
     "qkv_bias": true,
-    "max_seq_len": 131072
+    "max_seq_len": 65536
   },
   "train_config": {
-    "lr": 3e-5,
+    "lr": 1e-4,
     "weight_decay": 0.05,
-    "full_seq_len": 49152,
+    "full_seq_len": 32768,
     "clip_grad_norm": 100000,
     "optimizer": "AdamW"
   }
