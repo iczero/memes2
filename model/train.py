@@ -1,6 +1,5 @@
-import argparse
-import sys
 import typing
+import mlflow
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -20,21 +19,26 @@ class Trainer:
     device: torch.device
     model_dtype: torch.dtype = torch.float32
 
-    enable_autocast: bool
+    enable_autocast = True
     enable_compile = True
 
     model: QuestionableTransformer
     optimizer: torch.optim.AdamW | torch.optim.SGD
+
+    use_mlflow: bool
+    "True if we should log to mlflow"
 
     def __init__(
         self,
         config: CombinedConfig,
         device: torch.device,
         model_dtype: torch.dtype | None = None,
+        mlflow: bool = True
     ):
         self.model_config = config.model_config
         self.train_config = config.train_config
         self.device = device
+        self.use_mlflow = mlflow
 
         if model_dtype is not None:
             self.model_dtype = model_dtype
@@ -45,6 +49,8 @@ class Trainer:
         self.optimizer = self.make_optimizer(self.train_config.optimizer)
 
         self._cached_forward = None
+
+        self._log_config()
 
     def make_optim_param_groups(self):
         exclude_wd = []
@@ -79,6 +85,15 @@ class Trainer:
             )
 
         raise RuntimeError('unknown optimizer ' + optim_type)
+
+    def _log_config(self):
+        if not self.use_mlflow:
+            return
+
+        # we log both model and train config into the same namespace.
+        # there should not be any conflicts.
+        mlflow.log_params(self.model_config.to_dict())
+        mlflow.log_params(self.train_config.to_dict())
 
     def _make_forward(self, refresh = False):
         if self._cached_forward is not None and not refresh:
@@ -133,12 +148,23 @@ class Trainer:
     def zero_grad(self, set_to_none = True):
         self.optimizer.zero_grad(set_to_none)
 
-    @typing.overload
-    def make_input(self, seqs: list[torch.Tensor], seq_output_masks: None = None, override_length: int | None = None) -> tuple[int, torch.Tensor, torch.Tensor]: ...
-    @typing.overload
-    def make_input(self, seqs: list[torch.Tensor], seq_output_masks: list[torch.Tensor], override_length: int | None = None) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+    def clip_grad_norm(self):
+        return nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            self.train_config.clip_grad_norm,
+            error_if_nonfinite=True,
+        )
 
-    def make_input(
+    @typing.overload
+    def make_packed(self, seqs: list[torch.Tensor], override_length: int | None = None) -> tuple[int, torch.Tensor, torch.Tensor]: ...
+    @typing.overload
+    def make_packed(
+        self,
+        seqs: list[torch.Tensor],
+        seq_output_masks: list[torch.Tensor],
+        override_length: int | None = None,
+    ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+    def make_packed(
         self,
         seqs: list[torch.Tensor],
         seq_output_masks: list[torch.Tensor] | None = None,
@@ -154,10 +180,19 @@ class Trainer:
         """
         bpl = self.model_config.bytes_per_latent
         target_length = self.train_config.full_seq_len
+
+        if len(seqs) == 0:
+            raise ValueError('sequences cannot be empty')
+
         if override_length is not None:
             if override_length % self.model_config.bytes_per_latent != 0:
                 raise ValueError('length must be a multiple of bytes_per_latent')
             target_length = override_length
+
+        def expand_padding(seq_shape: torch.Size, padding: torch.Tensor):
+            out_shape = list(seq_shape)
+            out_shape[-1] = padding.shape[0]
+            return padding.expand(out_shape)
 
         total_seqs = 0
         total_length = 0
@@ -169,19 +204,22 @@ class Trainer:
             if seq_output_masks is not None:
                 seq_output_mask = seq_output_masks[i]
 
-            seq_padding = padding_needed(seq.shape[0], bpl)
+            seq_padding = padding_needed(seq.shape[-1], bpl)
             if seq_padding > 0:
                 seq = torch.cat([
                     seq,
-                    make_tokens([ControlTokens.PAD] * seq_padding).to(device='cpu'),
-                ], dim=0)
+                    expand_padding(
+                        seq.shape,
+                        make_tokens([ControlTokens.PAD] * seq_padding),
+                    ),
+                ], dim=-1)
                 if seq_output_mask is not None:
                     seq_output_mask = torch.cat([
                         seq_output_mask,
                         torch.tensor([False] * seq_padding, device='cpu', dtype=torch.bool),
                     ], dim=0)
 
-            seq_length = seq.shape[0]
+            seq_length = seq.shape[-1]
             if total_length + seq_length > target_length:
                 break
 
@@ -197,9 +235,9 @@ class Trainer:
 
         if end_padding_length > 0:
             end_padding = make_tokens([ControlTokens.PAD] * end_padding_length)
-            padded_seqs.append(end_padding)
+            padded_seqs.append(expand_padding(seqs[0].shape, end_padding))
 
-        packed_seq = torch.cat(padded_seqs, dim=0)
+        packed_seq = torch.cat(padded_seqs, dim=-1)
         seq_lengths = torch.tensor(
             seq_lengths_latent + end_padding_seqlens,
             device='cpu',

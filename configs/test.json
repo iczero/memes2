@@ -17,6 +17,7 @@
     "lr": 3e-5,
     "weight_decay": 0.05,
     "full_seq_len": 32768,
+    "clip_grad_norm": 100000,
     "optimizer": "AdamW"
   }
 }

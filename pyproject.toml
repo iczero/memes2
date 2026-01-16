@@ -26,3 +26,7 @@ index-strategy = "unsafe-best-match"
 name = "pytorch"
 # note: change this when 2.10 stabilizes
 url = "https://download.pytorch.org/whl/test/cu130"
+
+[tool.ty.rules]
+# spuriously fires on mlflow
+possibly-missing-attribute = "ignore"

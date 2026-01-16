@@ -7,7 +7,6 @@ import typing
 
 import torch
 from torch import nn
-from torch._functorch.config import activation_memory_budget
 
 @enum.verify(enum.CONTINUOUS)
 class ControlTokens(enum.IntEnum):
@@ -125,6 +124,8 @@ class TrainConfig:
     "Learning rate"
     weight_decay: float
     "Weight decay"
+    clip_grad_norm: float
+    "Clip gradient norms"
     optimizer: str
     "Optimizer to use"
     full_seq_len: int
@@ -172,6 +173,8 @@ def make_tokens(*parts: bytes | int | ControlTokens | Sequence[bytes | int | Con
                 out.append(token)
             case bytes() as bytestr:
                 out.extend(bytestr)
+            case str():
+                raise ValueError('please use bytes')
             case Sequence() as inner_list:
                 # there's probably a better way to do this, but whatever
                 for part in inner_list:
@@ -182,6 +185,8 @@ def make_tokens(*parts: bytes | int | ControlTokens | Sequence[bytes | int | Con
                             out.append(token)
                         case bytes() as bytestr:
                             out.extend(bytestr)
+                        case str():
+                            raise ValueError('please use bytes')
 
     return torch.tensor(out, device='cpu', dtype=torch.int32)
 
