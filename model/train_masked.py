@@ -1,6 +1,8 @@
+import typing
 import argparse
 import mlflow
 import signal
+import time
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -84,10 +86,11 @@ def main():
     if args.use_cpu:
         device = torch.device('cpu')
 
-    go_away = False
+    go_away = typing.cast(bool, False) # needed for ty for some reason
+    save_now = typing.cast(bool, False)
 
-    def go_away_handler(sig, frame):
-        nonlocal go_away
+    def signal_handler(sig, frame):
+        nonlocal go_away, save_now
         if sig == signal.SIGINT:
             if go_away:
                 print('exiting now!')
@@ -95,8 +98,19 @@ def main():
 
             go_away = True
             print('exiting soon')
+        elif sig == signal.SIGUSR1:
+            save_now = True
 
-    signal.signal(signal.SIGINT, go_away_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGUSR1, signal_handler)
+
+    def save_checkpoint():
+        to_save = trainer.state_dict()
+        to_save['step'] = step
+        # TODO: better
+        out_path = f'checkpoints/{int(time.time())}.pt'
+        torch.save(to_save, out_path)
+        print('saved checkpoint to', out_path)
 
     with mlflow.start_run():
         combined_config = load_config(args.config)
@@ -173,6 +187,12 @@ def main():
                 print('sample output:', tokens_repr(sample))
 
             step += 1
+
+            if save_now:
+                save_now = False
+                save_checkpoint()
+
+        save_checkpoint()
 
 if __name__ == '__main__' and not hasattr(__builtins__, '__IPYTHON__'):
     main()

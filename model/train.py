@@ -12,6 +12,7 @@ torch._functorch.config.activation_memory_budget = 0.5
 torch.set_float32_matmul_precision('high')
 
 ENABLE_ASSERTIONS = True
+USE_MLFLOW = True
 
 class Trainer:
     model_config: ModelConfig
@@ -33,12 +34,11 @@ class Trainer:
         config: CombinedConfig,
         device: torch.device,
         model_dtype: torch.dtype | None = None,
-        mlflow: bool = True
+        _restoring: bool = False,
     ):
         self.model_config = config.model_config
         self.train_config = config.train_config
         self.device = device
-        self.use_mlflow = mlflow
 
         if model_dtype is not None:
             self.model_dtype = model_dtype
@@ -50,7 +50,8 @@ class Trainer:
 
         self._cached_forward = None
 
-        self._log_config()
+        if not _restoring:
+            self.log_config()
 
     def make_optim_param_groups(self):
         exclude_wd = []
@@ -86,8 +87,8 @@ class Trainer:
 
         raise RuntimeError('unknown optimizer ' + optim_type)
 
-    def _log_config(self):
-        if not self.use_mlflow:
+    def log_config(self):
+        if not USE_MLFLOW:
             return
 
         # we log both model and train config into the same namespace.
@@ -254,3 +255,19 @@ class Trainer:
             return total_seqs, packed_seq, seq_lengths, output_mask
         else:
             return total_seqs, packed_seq, seq_lengths
+
+    def state_dict(self):
+        out = {
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'config': CombinedConfig(self.model_config, self.train_config).to_dict(),
+        }
+        if USE_MLFLOW:
+            out['run_id'] = mlflow.active_run().info.run_id
+        return out
+
+    @classmethod
+    def load_state_dict(cls, state, device: torch.device):
+        inst = cls(state['config'], device=device, _restoring=True)
+        inst.model.load_state_dict(state['model'])
+        inst.optimizer.load_state_dict(state['optimizer'])
