@@ -5,14 +5,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from model.common import ControlTokens, load_config, make_tokens, tokens_repr
-from model.model import QuestionableTransformer, SeqInfo
 from model.pile_loader import filter_text, load_dataset
 from model.train import Trainer
 
 import torch._functorch.config
 torch._functorch.config.activation_memory_budget = 0.5
 torch.set_float32_matmul_precision('high')
-device = torch.device('cuda')
 
 mlflow.config.enable_async_logging()
 mlflow.set_tracking_uri('http://127.0.0.1:5000')
@@ -20,6 +18,8 @@ mlflow.set_tracking_uri('http://127.0.0.1:5000')
 arg_parser = argparse.ArgumentParser()
 arg_parser.add_argument('config', help='path to config')
 arg_parser.add_argument('data', help='path to dataset')
+arg_parser.add_argument('--no-compile', action='store_true', help='disable torch.compile')
+arg_parser.add_argument('--use-cpu', action='store_true', help='use cpu instead of cuda')
 
 # thanks gemini
 def span_mask(
@@ -79,6 +79,11 @@ def span_mask(
 
 def main():
     args = arg_parser.parse_args()
+
+    device = torch.device('cuda')
+    if args.use_cpu:
+        device = torch.device('cpu')
+
     go_away = False
 
     def go_away_handler(sig, frame):
@@ -99,6 +104,10 @@ def main():
         model_config = trainer.model_config
         train_config = trainer.train_config
 
+        if args.no_compile:
+            print('disabling torch.compile')
+            trainer.enable_compile = False
+
         data_iter = filter_text(load_dataset(open(args.data, 'rb')))
 
         print('parameters:', sum(p.numel() for p in trainer.model.parameters()))
@@ -113,7 +122,7 @@ def main():
             max_len = train_config.full_seq_len - 2
             out_seq = make_tokens(
                 ControlTokens.START_OF_TEXT,
-                text[:max_len].encode(),
+                text.encode()[:max_len],
                 ControlTokens.END_OF_TEXT,
             )
 
@@ -135,15 +144,16 @@ def main():
                 raw_len += len(mask)
 
             seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seqs, masks)
-            #print(f'packed {_seq_count} sequences')
+            if seq_count == 0:
+                print('error: seq_count is zero! skipping')
+                continue
             packed = packed.to(device=trainer.device)
             seq_lengths = seq_lengths.to(device=trainer.device)
             out_mask = out_mask.to(trainer.device)
 
             in_masked = packed[0]
             out_seq = packed[1]
-            #print('in_masked', tokens_repr(in_masked), in_masked.shape)
-            #print('out_seq', tokens_repr(out_seq), out_seq.shape)
+            # TODO: enable_compile
             seq_info = trainer.model.make_seq_info(seq_lengths, compile=trainer.enable_compile)
 
             trainer.zero_grad()
@@ -159,7 +169,7 @@ def main():
             }, step=step)
 
             print(f'step {step}: loss {loss.item()}, grad norm {grad_norm.item()}')
-            if step % 64 == 0:
+            if step % 64 == 0 and step > 0:
                 print('sample output:', tokens_repr(sample))
 
             step += 1

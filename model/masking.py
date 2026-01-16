@@ -1,3 +1,4 @@
+import typing
 import torch
 import torch.nn.attention.flex_attention as fa
 
@@ -12,7 +13,7 @@ def lengths_to_bytelevel(lengths: torch.Tensor, bytes_per_latent: int) -> torch.
     return lengths * bytes_per_latent
 
 def lengths_to_positions(lengths: torch.Tensor) -> torch.Tensor:
-    construct_args = { 'device': lengths.device, 'dtype': lengths.dtype }
+    construct_args = typing.cast(typing.Any, { 'device': lengths.device, 'dtype': lengths.dtype })
     cumsum = lengths.cumsum(dim=0)
     total_len = cumsum[-1].item()
     excl_cumsum = torch.concat([
@@ -49,7 +50,7 @@ def create_fa_doc_mask(
             out = out & additional_mask(q_idx_orig, kv_idx_orig)
         return out
 
-    return fa.create_block_mask(
+    return torch.compile(fa.create_block_mask, disable=not compile)(
         mask_mod, None, None, q_len, kv_len,
-        device=doc_ids.device, _compile=compile
+        device=doc_ids.device,
     )

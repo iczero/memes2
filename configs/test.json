@@ -11,7 +11,8 @@
     "n_latent_layers": 6,
     "hc_expansion": 4,
     "activation": "silu",
-    "qkv_bias": true
+    "qkv_bias": true,
+    "max_seq_len": 131072
   },
   "train_config": {
     "lr": 3e-5,
