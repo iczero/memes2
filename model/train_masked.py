@@ -196,9 +196,9 @@ def main():
 
             in_masked = packed[0]
             out_seq = packed[1]
-            seq_info = trainer.model.make_seq_info(seq_lengths, compile=trainer.enable_compile)
 
             trainer.zero_grad()
+            seq_info = trainer.model.make_seq_info(seq_lengths, compile=trainer.enable_compile)
             loss, sample = trainer.forward_batch(in_masked, out_seq, out_mask, seq_info)
             loss.backward()
             grad_norm = trainer.clip_grad_norm()
@@ -213,8 +213,8 @@ def main():
 
             print(f'step {trainer.step}: loss {loss.item():.6f}, accuracy {accuracy * 100:.3f}%, grad norm {grad_norm.item()}')
             if trainer.step % 64 == 0 and trainer.step > 0:
-                print('sample output:  ', tokens_repr(sample[out_mask]))
                 print('sample expected:', tokens_repr(out_seq[out_mask]))
+                print('sample output:  ', tokens_repr(sample[out_mask]))
 
             trainer.step += 1
 

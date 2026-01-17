@@ -110,6 +110,10 @@ class Trainer:
 
         enable_autocast = self.enable_autocast
 
+        # warning: do NOT use cudagraphs. there appears to be a memory leak
+        # in the cudagraphs implementation that is not resolved by
+        # `cudagraphs_mark_step_begin`. additionally, the performance improvement
+        # is not significant enough to justify the headache
         @torch.compile(fullgraph=True, disable=not self.enable_compile)
         def inner_forward(
             seq_input: torch.Tensor,
@@ -321,4 +325,3 @@ class Trainer:
         run_id = state.get('run_id', None)
         inst = cls.load_state_dict(state, device, checkpoint_dir, replace_config=replace_config)
         return inst, run_id
-
