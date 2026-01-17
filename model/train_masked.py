@@ -211,7 +211,7 @@ def main():
                 'accuracy': accuracy,
             }, step=trainer.step)
 
-            print(f'step {trainer.step}: loss {loss.item()}, accuracy {accuracy * 100:.3f}%, grad norm {grad_norm.item()}')
+            print(f'step {trainer.step}: loss {loss.item():.6f}, accuracy {accuracy * 100:.3f}%, grad norm {grad_norm.item()}')
             if trainer.step % 64 == 0 and trainer.step > 0:
                 print('sample output:  ', tokens_repr(sample[out_mask]))
                 print('sample expected:', tokens_repr(out_seq[out_mask]))
