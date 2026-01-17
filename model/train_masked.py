@@ -203,14 +203,15 @@ def main():
             loss.backward()
             grad_norm = trainer.clip_grad_norm()
             trainer.optimizer_step()
+            accuracy = (sample[out_mask] == out_seq[out_mask]).to(dtype=torch.float).mean().item()
 
             mlflow.log_metrics({
                 'loss': loss.item(),
                 'grad_norm': grad_norm.item(),
-                'seq_count': seq_count,
+                'accuracy': accuracy,
             }, step=trainer.step)
 
-            print(f'step {trainer.step}: loss {loss.item()}, grad norm {grad_norm.item()}')
+            print(f'step {trainer.step}: loss {loss.item()}, accuracy {accuracy * 100:.3f}%, grad norm {grad_norm.item()}')
             if trainer.step % 64 == 0 and trainer.step > 0:
                 print('sample output:  ', tokens_repr(sample[out_mask]))
                 print('sample expected:', tokens_repr(out_seq[out_mask]))

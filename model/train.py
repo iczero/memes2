@@ -300,6 +300,7 @@ class Trainer:
                 state[k] = v
 
         out_name = f'step{self.step:07d}-{int(time.time())}.pt'
+        self.checkpoint_dir.mkdir(exist_ok=True)
         with open(self.checkpoint_dir / out_name, 'wb') as f:
             torch.save(state, f)
 
@@ -312,6 +313,7 @@ class Trainer:
             device: torch.device,
             replace_config: CombinedConfig | None = None,
     ) -> tuple[Self, str]:
+        # TODO: data loader state, somehow
         checkpoint_dir = checkpoint_path.absolute().parent
         with open(checkpoint_path, 'rb') as f:
             state = torch.load(f, map_location='cpu')
