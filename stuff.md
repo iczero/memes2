@@ -2,7 +2,6 @@
 - RMSNorm/LayerNorm equivalence: <https://arxiv.org/pdf/2305.14858>
 - hyperconnections: <https://arxiv.org/pdf/2409.19606>
 - manifold-constrained hyperconnections: <https://arxiv.org/pdf/2512.24880>
-- Meta's byte latent transformer: <https://arxiv.org/pdf/2412.09871>
 
 ## notes
 

@@ -32,7 +32,7 @@ start_or_load.add_argument('--load', type=str, help='load checkpoint file and co
 # thanks gemini
 def span_mask(
     input_tensor: torch.Tensor,
-    mask_range: tuple = (0.2, 0.35),
+    mask_range: tuple = (0.1, 0.2),
     mean_len: float = 10.0,
     std_len: float = 5.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
