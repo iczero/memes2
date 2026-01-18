@@ -1,7 +1,9 @@
+from pathlib import Path
 from collections.abc import Sequence
 import dataclasses
 import enum
 import json
+import subprocess
 from typing import Self
 import typing
 
@@ -240,3 +242,17 @@ def padding_needed(current_length: int, chunk_length: int) -> int:
         return 0
 
     return chunk_length - (current_length % chunk_length)
+
+def current_git_commit() -> str | None:
+    proc = subprocess.run(
+        args=['git', 'rev-parse', 'HEAD'],
+        cwd=Path(__name__).parent,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if proc.returncode != 0 or len(proc.stdout) == 0:
+        return None
+
+    return proc.stdout.strip()

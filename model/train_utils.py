@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from typing import Self, Iterator, Iterable
-from model.common import CombinedConfig, ControlTokens, ModelConfig, TrainConfig, make_tokens, padding_needed
+from model.common import CombinedConfig, ControlTokens, ModelConfig, TrainConfig, make_tokens, padding_needed, current_git_commit
 from model.model import QuestionableTransformer, SeqInfo
 from pathlib import Path
 
@@ -103,6 +103,10 @@ class Trainer:
         # there should not be any conflicts.
         mlflow.log_params(self.model_config.to_dict())
         mlflow.log_params(self.train_config.to_dict())
+
+        commit = current_git_commit()
+        if commit is not None:
+            mlflow.log_param('revision', commit)
 
     def _make_forward(self, refresh = False):
         if self._cached_forward is not None and not refresh:
