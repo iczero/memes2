@@ -537,11 +537,11 @@ class QuestionableTransformer(nn.Module):
         self.config = config
         self.rope_bytelevel = RotaryPositionalEncoding(
             config.d_qkv_bytelevel,
-            config.max_seq_len,
+            config.rope_max_seq_len,
         )
         self.rope_latent = RotaryPositionalEncoding(
             config.d_qkv_latent,
-            config.max_seq_len,
+            config.rope_max_seq_len,
         )
 
         self.embedding = nn.Embedding(config.vocab_size_, config.d_hidden_bytelevel)

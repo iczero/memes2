@@ -69,7 +69,7 @@ class ModelConfig:
     "Hyperconnections expansion rate. Set to 1 to disable hyperconnections"
     activation: str
     "Activation function"
-    max_seq_len: int
+    rope_max_seq_len: int
     "Maximum sequence length, in bytes (used by rope)"
     d_intermediate_latent: int = 0
     "Size of feedforward inner dimension (usually 4 * d_hidden_latent) of latent layers"
@@ -137,14 +137,23 @@ class TrainConfig:
     packed together. Changing this will require re-compiling the model forward
     and backward passes.
     """
+    train_max_seq_len: int
+    "Max sequence length during training. Longer sequences will be truncated"
+    mask_ratio_lower: float
+    "Masking ratio lower bound"
+    mask_ratio_upper: float
+    "Masking ratio upper bound"
 
     @classmethod
     def from_dict(cls, obj: dict, ignore_nonconfigurable = False) -> Self:
         return dataclass_from_dict(cls, obj, ignore_nonconfigurable=ignore_nonconfigurable)
 
+    def __post_init__(self):
+        if self.train_max_seq_len > self.full_seq_len:
+            raise ValueError('train_max_seq_len must not be longer than full_seq_len')
+
     def to_dict(self):
         return dataclasses.asdict(self)
-
 
 @dataclasses.dataclass
 class CombinedConfig:
@@ -159,7 +168,7 @@ class CombinedConfig:
         if self.train_config.full_seq_len % self.model_config.bytes_per_latent != 0:
             raise ValueError('full_seq_len must be a multiple of bytes_per_latent')
 
-        if self.train_config.full_seq_len > self.model_config.max_seq_len:
+        if self.train_config.full_seq_len > self.model_config.rope_max_seq_len:
             raise ValueError('rope max_seq_len must be >= full_seq_len')
 
     def to_dict(self) -> dict:

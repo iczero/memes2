@@ -4,7 +4,7 @@ import mlflow
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing import Self
+from typing import Self, Iterator, Iterable
 from model.common import CombinedConfig, ControlTokens, ModelConfig, TrainConfig, make_tokens, padding_needed
 from model.model import QuestionableTransformer, SeqInfo
 from pathlib import Path
@@ -169,33 +169,48 @@ class Trainer:
         )
 
     @typing.overload
-    def make_packed(self, seqs: list[torch.Tensor], override_length: int | None = None) -> tuple[int, torch.Tensor, torch.Tensor]: ...
-    @typing.overload
-    def make_packed(
-        self,
-        seqs: list[torch.Tensor],
-        seq_output_masks: list[torch.Tensor],
-        override_length: int | None = None,
-    ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]: ...
-    def make_packed(
-        self,
-        seqs: list[torch.Tensor],
-        seq_output_masks: list[torch.Tensor] | None = None,
-        override_length: int | None = None,
-    ) -> tuple[int, torch.Tensor, torch.Tensor] | tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def make_packed(self, seqs: Iterable[torch.Tensor], override_length: int | None = None) -> tuple[int, torch.Tensor, torch.Tensor]:
         """
+        Construct a packed sequence from an iterable of sequences.
+
+        `seqs` may have two dimensions, in which case sequences are processed as batches.
+        This is useful to specify for example the masked and expected output simultaneously.
+
         Returns:
             - `total_seqs`: how many sequences we managed to fit (starting from index 0 in `seqs`)
             - `packed_seq`: the packed input sequence
             - `seq_lengths`: length of each sequence in `packed_seq` in units of latents
               NOTE: `seq_lengths` will end with a lot of ones if end padding was needed.
-            - `output_mask`: (optional, only if `seq_output_masks provided`) Combined output mask.
         """
+        ...
+    @typing.overload
+    def make_packed(
+        self,
+        seqs: Iterable[tuple[torch.Tensor, torch.Tensor]],
+        override_length: int | None = None,
+    ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Construct a packed sequence from an iterable of tuples of sequences and their
+        corresponding output masks.
+
+        `seqs` may have two dimensions, in which case sequences are processed as batches.
+        This is useful to specify for example the masked and expected output simultaneously.
+
+        Returns:
+            - `total_seqs`: how many sequences we managed to fit (starting from index 0 in `seqs`)
+            - `packed_seq`: the packed input sequence
+            - `seq_lengths`: length of each sequence in `packed_seq` in units of latents
+              NOTE: `seq_lengths` will end with a lot of ones if end padding was needed.
+            - `output_mask`: Combined output mask.
+        """
+        ...
+    def make_packed(
+        self,
+        seqs: Iterable[torch.Tensor | tuple[torch.Tensor, torch.Tensor]],
+        override_length: int | None = None,
+    ) -> tuple[int, torch.Tensor, torch.Tensor] | tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         bpl = self.model_config.bytes_per_latent
         target_length = self.train_config.full_seq_len
-
-        if len(seqs) == 0:
-            raise ValueError('sequences cannot be empty')
 
         if override_length is not None:
             if override_length % self.model_config.bytes_per_latent != 0:
@@ -212,10 +227,29 @@ class Trainer:
         padded_seqs = []
         seq_lengths_latent = []
         output_masks = []
-        for i, seq in enumerate(seqs):
+        seq_shape_for_pad: torch.Size | None = None
+        has_output_masks: bool | None = None
+        seq_iter = seqs.__iter__()
+
+        while True:
+            # bubble StopIteration
+            seq = next(seq_iter)
+
             seq_output_mask = None
-            if seq_output_masks is not None:
-                seq_output_mask = seq_output_masks[i]
+            if not isinstance(seq, torch.Tensor):
+                seq, seq_output_mask = seq
+                if has_output_masks is None:
+                    has_output_masks = True
+                elif not has_output_masks:
+                    raise RuntimeError('expected item to have an output mask (previous iteration returned one)')
+            else:
+                if has_output_masks is None:
+                    has_output_masks = False
+                elif has_output_masks:
+                    raise RuntimeError('expected item to not have an output mask (previous iteration did not return one)')
+
+            if seq_shape_for_pad is None:
+                seq_shape_for_pad = seq.shape
 
             seq_padding = padding_needed(seq.shape[-1], bpl)
             if seq_padding > 0:
@@ -248,7 +282,8 @@ class Trainer:
 
         if end_padding_length > 0:
             end_padding = make_tokens([ControlTokens.PAD] * end_padding_length)
-            padded_seqs.append(expand_padding(seqs[0].shape, end_padding))
+            assert seq_shape_for_pad is not None
+            padded_seqs.append(expand_padding(seq_shape_for_pad, end_padding))
 
         packed_seq = torch.cat(padded_seqs, dim=-1)
         seq_lengths = torch.tensor(
@@ -257,7 +292,7 @@ class Trainer:
             dtype=torch.int32,
         )
 
-        if seq_output_masks is not None:
+        if has_output_masks:
             if end_padding_length > 0:
                 output_masks.append(
                     torch.tensor([False] * end_padding_length, device='cpu', dtype=torch.bool),

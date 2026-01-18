@@ -1,3 +1,5 @@
+from typing import Iterator
+import contextlib
 import typing
 import argparse
 import mlflow
@@ -8,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from model.common import ControlTokens, load_config, make_tokens, tokens_repr
 from model.pile_loader import filter_text, load_dataset
-from model.train import Trainer
+from model.train_utils import Trainer
 from pathlib import Path
 
 import torch._functorch.config
@@ -123,25 +125,43 @@ def main():
 
     data_iter = filter_text(load_dataset(open(args.data, 'rb')))
 
-    def make_one_seq(max_len: int):
-        text = next(data_iter, None)
-        if text is None:
-            print('data exhausted!')
-            return None
+    def seq_iter_fn() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        for text in data_iter:
+            # TODO: make this less garbage
+            max_len = train_config.train_max_seq_len - 2
+            out_seq = make_tokens(
+                ControlTokens.START_OF_TEXT,
+                text.encode()[:max_len],
+                ControlTokens.END_OF_TEXT,
+            )
 
-        # TODO: make this less garbage
-        max_len = max_len - 2
-        out_seq = make_tokens(
-            ControlTokens.START_OF_TEXT,
-            text.encode()[:max_len],
-            ControlTokens.END_OF_TEXT,
-        )
+            in_masked, out_mask = span_mask(
+                out_seq,
+                mask_range=(train_config.mask_ratio_lower, train_config.mask_ratio_upper),
+            )
 
-        in_masked, out_mask = span_mask(out_seq)
+            stacked = torch.stack([in_masked, out_seq], dim=0)
 
-        stacked = torch.stack([in_masked, out_seq], dim=0)
+            yield stacked, out_mask
 
-        return stacked, out_mask
+        print('data exhausted!')
+
+    seq_iter = seq_iter_fn()
+
+    @contextlib.contextmanager
+    def save_on_exit():
+        try:
+            yield
+            print('train loop exited, saving checkpoint')
+            trainer.save_checkpoint()
+        except Exception:
+            if trainer.step < 10:
+                print('error occurred but not saving checkpoint (too early)')
+            else:
+                print('error occurred, saving checkpoint')
+                trainer.save_checkpoint()
+            raise
+        # don't save on KeyboardInterrupt, the signal handler already handles that
 
     go_away = typing.cast(bool, False) # needed for ty for some reason
     save_now = typing.cast(bool, False)
@@ -167,27 +187,12 @@ def main():
     signal.signal(signal.SIGUSR1, signal_handler)
     signal.signal(signal.SIGQUIT, signal_handler)
 
-    with mlflow_ctxmgr:
+    with mlflow_ctxmgr, save_on_exit():
         while not go_away:
-            raw_len = 0
-            seqs = []
-            masks = []
-            while raw_len < train_config.full_seq_len:
-                next_seq = make_one_seq(train_config.full_seq_len - raw_len)
-                if next_seq is None:
-                    break
-                seq, mask = next_seq
-                seqs.append(seq)
-                masks.append(mask)
-                raw_len += len(mask)
-
-            if len(seqs) == 0:
-                print('no more sequences available, exiting')
-                break
-
-            seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seqs, masks)
+            seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seq_iter)
             if seq_count == 0:
-                print('error: seq_count is zero! skipping')
+                # this should not happen
+                print('error: seq_count is zero! skippping')
                 continue
             packed = packed.to(device=trainer.device)
             seq_lengths = seq_lengths.to(device=trainer.device)
@@ -208,6 +213,7 @@ def main():
                 'loss': loss.item(),
                 'grad_norm': grad_norm.item(),
                 'accuracy': accuracy,
+                'seq_count': seq_count,
             }, step=trainer.step)
 
             print(f'step {trainer.step}: loss {loss.item():.6f}, accuracy {accuracy * 100:.3f}%, grad norm {grad_norm.item()}')
