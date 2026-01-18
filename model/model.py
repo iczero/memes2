@@ -128,10 +128,6 @@ class SinkhornKnopp(nn.Module):
 
         return x
 
-def reshape_last(x: torch.Tensor, new_dim: int) -> torch.Tensor:
-    "Reshape the last dimension of a tensor"
-    return x.flatten(-2, -1).unflatten(-1, (-1, new_dim))
-
 class ByteToLatentAttention(nn.Module):
     def __init__(
         self,
@@ -144,15 +140,27 @@ class ByteToLatentAttention(nn.Module):
         bias=True,
     ):
         super().__init__()
-        self.inner = ResamplingAttention(
+        self.n_attention_heads = n_attention_heads
+        self.pre_norm = LayerNormImpl([d_hidden_bytelevel], elementwise_affine=True)
+        self.pooling = nn.MaxPool1d(bytes_per_latent)
+
+        # query from pooled bytes
+        self.w_q = nn.Linear(
             d_hidden_bytelevel,
-            d_hidden_latent,
-            d_qkv_bytelevel,
-            bytes_per_latent * d_hidden_bytelevel,
-            n_attention_heads,
-            rope_bytelevel,
-            bias,
+            n_attention_heads * d_qkv_bytelevel,
+            bias=bias,
         )
+        # key/value from bytes
+        self.w_kv_merged = nn.Linear(
+            d_hidden_bytelevel,
+            2 * n_attention_heads * d_qkv_bytelevel,
+            bias=bias,
+        )
+
+        self.rope_bytelevel = rope_bytelevel
+        assert self.rope_bytelevel.d_hidden() == d_qkv_bytelevel
+
+        self.w_out = nn.Linear(n_attention_heads * d_qkv_bytelevel, d_hidden_latent)
 
     def forward(
         self,
@@ -161,7 +169,42 @@ class ByteToLatentAttention(nn.Module):
         rope_pos_latent: torch.Tensor,
         attn_mask,
     ):
-        return self.inner(x, rope_pos_latent, rope_pos_bytelevel, attn_mask)
+        normalized = self.pre_norm(x)
+
+        # query from pooled
+        # need transpose because MaxPool1d uses (channels, seq)
+        pooled = self.pooling(normalized.transpose(-2, -1)).transpose(-2, -1)
+        q = einops.rearrange(
+            self.w_q(pooled),
+            '... seq (heads d_qkv) -> ... heads seq d_qkv',
+            heads=self.n_attention_heads
+        )
+
+        # key/value from bytelevel
+        kv_merged = einops.rearrange(
+            self.w_kv_merged(normalized),
+            '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
+            split=2, heads=self.n_attention_heads,
+        )
+        k = kv_merged[..., 0, :]
+        v = kv_merged[..., 1, :]
+
+        q = self.rope_bytelevel(q, positions=rope_pos_latent)
+        k = self.rope_bytelevel(k, positions=rope_pos_bytelevel)
+
+        need_squeeze, q, k, v = fa_ensure_batch(q, k, v)
+        attn_out = fa.flex_attention(
+            q, k, v,
+            block_mask=attn_mask,
+        )
+        if need_squeeze:
+            attn_out = attn_out.squeeze(0)
+        attn_concat = einops.rearrange(
+            attn_out,
+            '... heads seq d_qkv -> ... seq (heads d_qkv)',
+        )
+        out = self.w_out(attn_concat)
+        return out
 
 class LatentToByteAttention(nn.Module):
     def __init__(
@@ -175,98 +218,57 @@ class LatentToByteAttention(nn.Module):
         bias=True,
     ):
         super().__init__()
-        self.inner = ResamplingAttention(
-            d_hidden_latent,
+        self.n_attention_heads = n_attention_heads
+        self.latent_norm = LayerNormImpl([d_hidden_latent], elementwise_affine=True)
+        self.bytelevel_norm = LayerNormImpl([d_hidden_bytelevel], elementwise_affine=True)
+
+        # query from bytelevel skip connection
+        self.w_q = nn.Linear(
             d_hidden_bytelevel,
-            d_qkv_latent,
-            d_hidden_latent // bytes_per_latent,
-            n_attention_heads,
-            rope_latent,
-            bias,
+            n_attention_heads * d_qkv_latent,
+            bias=bias,
         )
+        # key/value from latents
+        self.w_kv_merged = nn.Linear(
+            d_hidden_latent,
+            2 * n_attention_heads * d_qkv_latent,
+            bias=bias,
+        )
+
+        self.rope_latent = rope_latent
+        assert self.rope_latent.d_hidden() == d_qkv_latent
+
+        self.w_out = nn.Linear(n_attention_heads * d_qkv_latent, d_hidden_bytelevel)
 
     def forward(
         self,
-        x: torch.Tensor,
+        latent: torch.Tensor,
+        byte_skip: torch.Tensor,
         rope_pos_latent: torch.Tensor,
         rope_pos_bytelevel: torch.Tensor,
         attn_mask,
     ):
-        return self.inner(x, rope_pos_bytelevel, rope_pos_latent, attn_mask)
+        bytelevel_normalized = self.bytelevel_norm(byte_skip)
+        latent_normalized = self.latent_norm(latent)
 
-class ResamplingAttention(nn.Module):
-    def __init__(
-        self,
-        d_hidden_in: int,
-        d_hidden_out: int,
-        d_qkv: int,
-        d_hidden_in_reshape: int,
-        n_attention_heads: int,
-        rope: RotaryPositionalEncoding,
-        bias=True,
-    ):
-        super().__init__()
-        self.d_hidden_in = d_hidden_in
-        self.d_hidden_out = d_hidden_out
-        self.d_qkv = d_qkv
-        self.d_hidden_in_reshape = d_hidden_in_reshape
-        self.n_attention_heads = n_attention_heads
-
-        self.pre_norm = LayerNormImpl([d_hidden_in], elementwise_affine=True)
-
-        # query: byte -> concat -> w_q -> sdpa
-        self.w_q = nn.Linear(
-            d_hidden_in_reshape,
-            n_attention_heads * d_qkv,
-            bias=bias,
-        )
-        # key/value: input to d_qkv
-        self.w_kv_merged = nn.Linear(
-            d_hidden_in,
-            2 * n_attention_heads * d_qkv,
-            bias=bias,
-        )
-
-        self.rope = rope
-        assert self.rope.d_hidden() == d_qkv
-
-        self.w_out = nn.Linear(n_attention_heads * d_qkv, d_hidden_out)
-
-        # bypass is transformed with linear before being added
-        # byte -> merge -> bypass_proj -> latent
-        # (worst case it becomes zero)
-        self.bypass_linear = nn.Linear(d_hidden_in_reshape, d_hidden_out, bias=False)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        rope_pos_q: torch.Tensor,
-        rope_pos_k: torch.Tensor,
-        attn_mask: fa.BlockMask,
-    ) -> torch.Tensor:
-        normalized = self.pre_norm(x)
-
-        # group for latent, or split when going back to bytelevel
-        hidden_reshaped = reshape_last(normalized, self.d_hidden_in_reshape)
-
-        # query from hidden_reshaped
+        # query from bytelevel skip
         q = einops.rearrange(
-            self.w_q(hidden_reshaped),
+            self.w_q(bytelevel_normalized),
             '... seq (heads d_qkv) -> ... heads seq d_qkv',
             heads=self.n_attention_heads
         )
 
-        # key/value from previous sequence without concat/split
+        # key/value latents
         kv_merged = einops.rearrange(
-            self.w_kv_merged(normalized),
+            self.w_kv_merged(latent_normalized),
             '... seq (split heads d_qkv) -> ... heads seq split d_qkv',
             split=2, heads=self.n_attention_heads,
         )
         k = kv_merged[..., 0, :]
         v = kv_merged[..., 1, :]
 
-        q = self.rope(q, positions=rope_pos_q)
-        k = self.rope(k, positions=rope_pos_k)
+        q = self.rope_latent(q, positions=rope_pos_bytelevel)
+        k = self.rope_latent(k, positions=rope_pos_latent)
 
         need_squeeze, q, k, v = fa_ensure_batch(q, k, v)
         attn_out = fa.flex_attention(
@@ -274,17 +276,13 @@ class ResamplingAttention(nn.Module):
             block_mask=attn_mask,
         )
         if need_squeeze:
-            attn_out = attn_out.squeeze(0) # type: ignore
+            attn_out = attn_out.squeeze(0)
         attn_concat = einops.rearrange(
             attn_out,
             '... heads seq d_qkv -> ... seq (heads d_qkv)',
         )
         out = self.w_out(attn_concat)
-
-        # linear transform for skip connection
-        bypass = self.bypass_linear(reshape_last(x, self.d_hidden_in_reshape))
-
-        return out + bypass
+        return out
 
 class HyperconnectionParams(nn.Module):
     def __init__(self, d_hidden: int, hc_expansion: int, hc_gating_init: float, sk_iters: int):
@@ -451,7 +449,7 @@ class LatentBlock(nn.Module):
 class BytelevelToLatentBlock(nn.Module):
     def __init__(self, config: ModelConfig, rope_bytelevel: RotaryPositionalEncoding):
         super().__init__()
-        self.resample = ByteToLatentAttention(
+        self.cross_attn = ByteToLatentAttention(
             config.d_hidden_bytelevel,
             config.d_hidden_latent,
             config.d_qkv_bytelevel,
@@ -475,7 +473,7 @@ class BytelevelToLatentBlock(nn.Module):
 
     # note: rope_pos_latent should probably be strided
     def forward(self, x: torch.Tensor, rope_pos_bytelevel: torch.Tensor, rope_pos_latent: torch.Tensor, attn_mask: fa.BlockMask):
-        x = self.resample(x, rope_pos_bytelevel, rope_pos_latent, attn_mask)
+        x = self.cross_attn(x, rope_pos_bytelevel, rope_pos_latent, attn_mask)
         x_wide = self.hc_expand(x)
 
         h_pre, h_post, h_res = self.ff_hc_params(x_wide)
@@ -489,7 +487,7 @@ class LatentToBytelevelBlock(nn.Module):
     def __init__(self, config: ModelConfig, rope_latent: RotaryPositionalEncoding):
         super().__init__()
         self.hc_merge = HcMerge(config.hc_expansion)
-        self.resample = LatentToByteAttention(
+        self.cross_attn = LatentToByteAttention(
             config.d_hidden_latent,
             config.d_hidden_bytelevel,
             config.d_qkv_latent,
@@ -505,9 +503,16 @@ class LatentToBytelevelBlock(nn.Module):
         )
 
     # note: rope_pos_latent should probably be strided
-    def forward(self, x_wide: torch.Tensor, rope_pos_latent: torch.Tensor, rope_pos_bytelevel: torch.Tensor, attn_mask: fa.BlockMask):
+    def forward(
+        self,
+        x_wide: torch.Tensor,
+        bytelevel_skip: torch.Tensor,
+        rope_pos_latent: torch.Tensor,
+        rope_pos_bytelevel: torch.Tensor,
+        attn_mask: fa.BlockMask,
+    ):
         x = self.hc_merge(x_wide)
-        x = self.resample(x, rope_pos_latent, rope_pos_bytelevel, attn_mask)
+        x = self.cross_attn(x, bytelevel_skip, rope_pos_latent, rope_pos_bytelevel, attn_mask)
 
         x_l = self.ff_norm(x)
         x_l = self.feedforward(x_l)
@@ -616,6 +621,7 @@ class QuestionableTransformer(nn.Module):
         for layer in self.bytelevel_encode_layers:
             x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)
 
+        bytelevel_skip = x
         x_wide = self.bytelevel_to_latent(
             x,
             si.seq_positions_bytelevel,
@@ -629,6 +635,7 @@ class QuestionableTransformer(nn.Module):
 
         x = self.latent_to_bytelevel(
             x_wide,
+            bytelevel_skip,
             si.seq_positions_latent_strided,
             si.seq_positions_bytelevel,
             si.attn_mask_latent_to_bytelevel
