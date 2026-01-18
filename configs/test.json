@@ -12,12 +12,12 @@
     "hc_expansion": 4,
     "activation": "silu",
     "qkv_bias": true,
-    "max_seq_len": 65536
+    "max_seq_len": 32768
   },
   "train_config": {
     "lr": 1e-4,
     "weight_decay": 0.05,
-    "full_seq_len": 32768,
+    "full_seq_len": 24576,
     "clip_grad_norm": 5,
     "optimizer": "AdamW"
   }

@@ -104,7 +104,7 @@ class SelfAttention(nn.Module):
             block_mask=attn_block_mask,
         )
         if need_squeeze:
-            attn_out = attn_out.squeeze(0) # type: ignore
+            attn_out = attn_out.squeeze(0)
         # shape: (batch, heads, seq, d_qkv)
 
         # transpose and concat
