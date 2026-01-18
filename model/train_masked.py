@@ -189,22 +189,28 @@ def main():
 
     with mlflow_ctxmgr, save_on_exit():
         while not go_away:
-            seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seq_iter)
-            if seq_count == 0:
-                # this should not happen
-                print('error: seq_count is zero! skippping')
-                continue
-            packed = packed.to(device=trainer.device)
-            seq_lengths = seq_lengths.to(device=trainer.device)
-            out_mask = out_mask.to(trainer.device)
-
-            in_masked = packed[0]
-            out_seq = packed[1]
-
             trainer.zero_grad()
-            seq_info = trainer.model.make_seq_info(seq_lengths, compile=trainer.enable_compile)
-            loss, sample = trainer.forward_batch(in_masked, out_seq, out_mask, seq_info)
-            loss.backward()
+            for acc_step in range(0, train_config.accumulate_gradients):
+                seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seq_iter)
+                if seq_count == 0:
+                    # this should not happen
+                    raise RuntimeError('seq_count is zero')
+                packed = packed.to(device=trainer.device)
+                seq_lengths = seq_lengths.to(device=trainer.device)
+                out_mask = out_mask.to(trainer.device)
+
+                in_masked = packed[0]
+                out_seq = packed[1]
+
+                seq_info = trainer.model.make_seq_info(seq_lengths, compile=trainer.enable_compile)
+                loss, sample = trainer.forward_batch(in_masked, out_seq, out_mask, seq_info)
+                loss.backward()
+
+            if train_config.accumulate_gradients > 1:
+                for param in trainer.model.parameters():
+                    if param.grad is not None:
+                        param.grad.div_(train_config.accumulate_gradients)
+
             grad_norm = trainer.clip_grad_norm()
             trainer.optimizer_step()
             accuracy = (sample[out_mask] == out_seq[out_mask]).to(dtype=torch.float).mean().item()

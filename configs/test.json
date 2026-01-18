@@ -22,6 +22,7 @@
     "mask_ratio_lower": 0.25,
     "mask_ratio_upper": 0.35,
     "clip_grad_norm": 5,
+    "accumulate_gradients": 2,
     "optimizer": "AdamW"
   }
 }

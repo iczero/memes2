@@ -131,6 +131,8 @@ class TrainConfig:
     "Weight decay"
     clip_grad_norm: float
     "Clip gradient norms"
+    accumulate_gradients: int
+    "Gradient accumulation steps, set to 1 to disable accumulation"
     optimizer: str
     "Optimizer to use"
     full_seq_len: int
