@@ -3,7 +3,6 @@ import argparse
 import mlflow
 import signal
 import sys
-import time
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -124,14 +123,14 @@ def main():
 
     data_iter = filter_text(load_dataset(open(args.data, 'rb')))
 
-    def make_one_seq():
+    def make_one_seq(max_len: int):
         text = next(data_iter, None)
         if text is None:
             print('data exhausted!')
             return None
 
         # TODO: make this less garbage
-        max_len = train_config.full_seq_len - 2
+        max_len = max_len - 2
         out_seq = make_tokens(
             ControlTokens.START_OF_TEXT,
             text.encode()[:max_len],
@@ -174,7 +173,7 @@ def main():
             seqs = []
             masks = []
             while raw_len < train_config.full_seq_len:
-                next_seq = make_one_seq()
+                next_seq = make_one_seq(train_config.full_seq_len - raw_len)
                 if next_seq is None:
                     break
                 seq, mask = next_seq
