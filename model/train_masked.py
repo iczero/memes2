@@ -227,7 +227,5 @@ def main():
                 save_now = False
                 trainer.save_checkpoint()
 
-        trainer.save_checkpoint()
-
 if __name__ == '__main__' and not hasattr(__builtins__, '__IPYTHON__'):
     main()

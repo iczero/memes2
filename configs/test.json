@@ -18,7 +18,7 @@
     "lr": 1e-4,
     "weight_decay": 0.05,
     "full_seq_len": 24576,
-    "train_max_seq_len": 16384,
+    "train_max_seq_len": 8192,
     "mask_ratio_lower": 0.25,
     "mask_ratio_upper": 0.35,
     "clip_grad_norm": 5,
