@@ -4,7 +4,7 @@ import mlflow
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing import Self, Iterator, Iterable
+from typing import Self, Iterable
 from model.common import CombinedConfig, ControlTokens, ModelConfig, TrainConfig, make_tokens, padding_needed, current_git_commit
 from model.model import QuestionableTransformer, SeqInfo
 from pathlib import Path
@@ -217,7 +217,7 @@ class Trainer:
         target_length = self.train_config.full_seq_len
 
         if override_length is not None:
-            if override_length % self.model_config.bytes_per_latent != 0:
+            if override_length % bpl != 0:
                 raise ValueError('length must be a multiple of bytes_per_latent')
             target_length = override_length
 
@@ -355,12 +355,16 @@ class Trainer:
             checkpoint_path: Path,
             device: torch.device,
             replace_config: CombinedConfig | None = None,
-    ) -> tuple[Self, str]:
+    ) -> tuple[Self, dict]:
         # TODO: data loader state, somehow
         checkpoint_dir = checkpoint_path.absolute().parent
         with open(checkpoint_path, 'rb') as f:
             state = torch.load(f, map_location='cpu')
 
-        run_id = state.get('run_id', None)
         inst = cls.load_state_dict(state, device, checkpoint_dir, replace_config=replace_config)
-        return inst, run_id
+        # better way to do this?
+        del state['config']
+        del state['step']
+        del state['model']
+        del state['optimizer']
+        return inst, state

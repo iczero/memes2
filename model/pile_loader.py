@@ -37,7 +37,8 @@ def filter_text(data):
     for _count, set_name, text in data:
         if set_name not in (
             'BookCorpus2', 'Books3', 'Enron Emails', 'Gutenberg (PG-19)',
-            'HackerNews', 'OpenWebText2', 'Ubuntu IRC', 'Wikipedia (en)'
+            'HackerNews', 'OpenWebText2', 'Ubuntu IRC', 'Wikipedia (en)',
+            'StackExchange', 'Pile-CC', 'USPTO Backgrounds', 'OpenSubtitles',
         ):
             continue
 

@@ -109,8 +109,8 @@ def main():
             replace_config = load_config(args.config)
         checkpoint_path = Path(args.load)
 
-        trainer, run_id = Trainer.load_checkpoint(checkpoint_path, device, replace_config=replace_config)
-        mlflow_ctxmgr = mlflow.start_run(run_id=run_id)
+        trainer, additional = Trainer.load_checkpoint(checkpoint_path, device, replace_config=replace_config)
+        mlflow_ctxmgr = mlflow.start_run(run_id=additional.get('run_id', None))
     else:
         raise RuntimeError('required option missing')
 
@@ -190,11 +190,14 @@ def main():
     with mlflow_ctxmgr, save_on_exit():
         while not go_away:
             trainer.zero_grad()
+            total_seq_count = 0
             for acc_step in range(0, train_config.accumulate_gradients):
                 seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seq_iter)
                 if seq_count == 0:
                     # this should not happen
                     raise RuntimeError('seq_count is zero')
+
+                total_seq_count += seq_count
                 packed = packed.to(device=trainer.device)
                 seq_lengths = seq_lengths.to(device=trainer.device)
                 out_mask = out_mask.to(trainer.device)
@@ -219,7 +222,7 @@ def main():
                 'loss': loss.item(),
                 'grad_norm': grad_norm.item(),
                 'accuracy': accuracy,
-                'seq_count': seq_count,
+                'seq_count': total_seq_count,
             }, step=trainer.step)
 
             print(f'step {trainer.step}: loss {loss.item():.6f}, accuracy {accuracy * 100:.3f}%, grad norm {grad_norm.item()}')
