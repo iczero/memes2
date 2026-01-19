@@ -6,6 +6,7 @@ import argparse
 import mlflow
 import signal
 import sys
+import time
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -27,6 +28,7 @@ arg_parser.add_argument('--config', type=str, help='path to config', default=Non
 arg_parser.add_argument('--data', type=str, help='path to dataset', required=True)
 arg_parser.add_argument('--no-compile', action='store_true', help='disable torch.compile')
 arg_parser.add_argument('--use-cpu', action='store_true', help='use cpu instead of cuda')
+arg_parser.add_argument('--checkpoint-interval', type=int, help='checkpoint interval in seconds', default=7200)
 start_or_load = arg_parser.add_mutually_exclusive_group(required=True)
 start_or_load.add_argument('--new', type=str, help='start new run in provided checkpoint directory', default=None)
 start_or_load.add_argument('--load', type=str, help='load checkpoint file and continue', default=None)
@@ -167,6 +169,7 @@ def main():
 
     go_away = typing.cast(bool, False) # needed for ty for some reason
     save_now = typing.cast(bool, False)
+    last_checkpoint_time = time.time()
 
     def signal_handler(sig, _frame):
         nonlocal go_away, save_now
@@ -234,8 +237,13 @@ def main():
 
             trainer.step += 1
 
+            if time.time() > last_checkpoint_time + args.checkpoint_interval:
+                print('checkpoint interval reached, saving checkpoint...')
+                save_now = True
+
             if save_now:
                 save_now = False
+                last_checkpoint_time = time.time()
                 trainer.save_checkpoint()
 
 if __name__ == '__main__' and not hasattr(__builtins__, '__IPYTHON__'):
