@@ -1,3 +1,4 @@
+import os
 from typing import Iterator
 import contextlib
 import typing
@@ -18,7 +19,8 @@ torch._functorch.config.activation_memory_budget = 0.5
 torch.set_float32_matmul_precision('high')
 
 mlflow.config.enable_async_logging()
-mlflow.set_tracking_uri('http://127.0.0.1:5000')
+if os.environ.get('MLFLOW_TRACKING_URI', None) is None:
+    mlflow.set_tracking_uri('http://127.0.0.1:5000')
 
 arg_parser = argparse.ArgumentParser()
 arg_parser.add_argument('--config', type=str, help='path to config', default=None)
