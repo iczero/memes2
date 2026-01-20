@@ -302,7 +302,8 @@ class HyperconnectionParams(nn.Module):
         self.gating_res = nn.Parameter(torch.tensor([hc_gating_init]))
         self.static_mapping = nn.Parameter(
             torch.cat([
-                torch.ones((2, hc_expansion)),
+                torch.full((1, hc_expansion), 1 / hc_expansion),
+                torch.ones((1, hc_expansion)),
                 torch.eye(hc_expansion),
             ], dim=0)
         )

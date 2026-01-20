@@ -67,7 +67,7 @@ class Trainer:
         for name, param in self.model.named_parameters():
             if len(param.shape) < 2 \
                     or name.endswith('.bias') \
-                    or name.endswith('.positional_encodings'):
+                    or 'hc_params' in name:
                 exclude_wd.append(param)
             else:
                 default.append(param)
