@@ -76,7 +76,7 @@ def span_mask(
         start_idx = torch.randint(start_pos, end_pos, (1,)).item()
 
         # 3. Calculate end index (clamped to seq length)
-        end_idx = min(start_idx + span_len, seq_len)
+        end_idx = min(start_idx + span_len, end_pos)
 
         # 4. Apply to mask_bool
         mask_bool[start_idx:end_idx] = True
@@ -199,7 +199,7 @@ def main():
     signal.signal(signal.SIGUSR1, signal_handler)
     signal.signal(signal.SIGQUIT, signal_handler)
 
-    with mlflow_ctxmgr, save_on_exit():
+    with mlflow_ctxmgr, save_on_exit(), torch.autograd.set_detect_anomaly(True):
         while not go_away:
             trainer.zero_grad()
             total_seq_count = 0

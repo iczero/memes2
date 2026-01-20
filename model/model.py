@@ -10,6 +10,7 @@ from model.masking import create_fa_doc_mask, lengths_to_bytelevel, lengths_to_d
 from model.rotary_encoding import RotaryPositionalEncoding
 
 LayerNormImpl = nn.RMSNorm
+flex_attention = torch.compile(fa.flex_attention)
 
 def fa_ensure_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor]:
     # flex attention wants 4 dimensions (batch, head, seq, hidden) but we
@@ -99,7 +100,7 @@ class SelfAttention(nn.Module):
             k = self.rope(k, rope_pos)
 
         need_squeeze, q, k, v = fa_ensure_batch(q, k, v)
-        attn_out = fa.flex_attention(
+        attn_out = flex_attention(
             q, k, v,
             block_mask=attn_block_mask,
         )
@@ -121,10 +122,10 @@ class SinkhornKnopp(nn.Module):
         self.n_iter = n_iter
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.exp()
+        x = x.clamp(max=15).exp()
         for _i in range(0, self.n_iter):
-            x = F.normalize(x, p=1, dim=-1)
-            x = F.normalize(x, p=1, dim=-2)
+            x = F.normalize(x, p=1, dim=-1, eps=1e-6)
+            x = F.normalize(x, p=1, dim=-2, eps=1e-6)
 
         return x
 
@@ -269,12 +270,12 @@ class ResamplingAttention(nn.Module):
         k = self.rope(k, positions=rope_pos_k)
 
         need_squeeze, q, k, v = fa_ensure_batch(q, k, v)
-        attn_out = fa.flex_attention(
+        attn_out = flex_attention(
             q, k, v,
             block_mask=attn_mask,
         )
         if need_squeeze:
-            attn_out = attn_out.squeeze(0) # type: ignore
+            attn_out = attn_out.squeeze(0)
         attn_concat = einops.rearrange(
             attn_out,
             '... heads seq d_qkv -> ... seq (heads d_qkv)',
@@ -637,5 +638,6 @@ class QuestionableTransformer(nn.Module):
 
         for layer in self.bytelevel_decode_layers:
             x = layer(x, si.seq_positions_bytelevel, si.attn_mask_bytelevel)
+
         x = self.lm_head(x)
         return x

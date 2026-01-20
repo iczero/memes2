@@ -1,12 +1,12 @@
 from pathlib import Path
-from io import IOBase
+from io import IOBase, BufferedReader
 from model.common import TextLoader
 import json
 import zstandard
 
 class PileLoader(TextLoader):
     def open_file(self, path: Path) -> IOBase:
-        return zstandard.open(path, 'rb')
+        return BufferedReader(zstandard.open(path, 'rb'))
 
     def next(self) -> str:
         if self.current_file is None:
