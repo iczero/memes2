@@ -1,3 +1,4 @@
+from io import IOBase
 from pathlib import Path
 from collections.abc import Sequence
 import dataclasses
@@ -182,7 +183,10 @@ def load_config(path: str):
     with open(path, 'r') as f:
         return CombinedConfig.from_dict(json.load(f))
 
-def make_tokens(*parts: bytes | int | ControlTokens | Sequence[bytes | int | ControlTokens]):
+def make_tokens(
+    *parts: bytes | int | ControlTokens | Sequence[bytes | int | ControlTokens],
+    pin_memory = True,
+):
     out: list[int] = []
     for part in parts:
         match part:
@@ -207,8 +211,7 @@ def make_tokens(*parts: bytes | int | ControlTokens | Sequence[bytes | int | Con
                         case str():
                             raise ValueError('please use bytes')
 
-    return torch.tensor(out, device='cpu', dtype=torch.int32)
-
+    return torch.tensor(out, device='cpu', dtype=torch.int32, pin_memory=pin_memory)
 
 def tokens_repr(tokens: torch.Tensor | list[int]) -> bytes:
     out = []
@@ -258,3 +261,63 @@ def current_git_commit() -> str | None:
         return None
 
     return proc.stdout.strip()
+
+class TextLoader:
+    base_dir: Path
+    file_list: list[Path]
+    current_file: IOBase | None = None
+    current_index: int
+
+    def __init__(self, base_dir: Path | str):
+        if isinstance(base_dir, str):
+            self.base_dir = Path(base_dir).absolute()
+        else:
+            self.base_dir = base_dir.absolute()
+
+        self.file_list = list(self.base_dir.iterdir())
+        self.file_list.sort(key=lambda p: p.name)
+
+    @classmethod
+    def from_file(cls, file_path: Path | str):
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+
+        file_path = file_path.absolute()
+
+        base_dir = file_path.parent
+        file_name = file_path.name
+        loader = cls(base_dir)
+        loader.switch_file_by_name(file_name)
+        return loader
+
+    def switch_file_by_name(self, name: str):
+        target_idx = None
+        for i, p in enumerate(self.file_list):
+            if p.name == name:
+                target_idx = i
+
+        if target_idx is None:
+            raise ValueError('could not find requested file')
+
+        self.switch_file_by_index(target_idx)
+
+    def switch_file_by_index(self, index: int):
+        if index >= len(self.file_list):
+            raise ValueError('index out of range')
+
+        if self.current_file is not None:
+            self.current_file.close()
+
+        self.current_index = index
+        file_path = self.file_list[index]
+        print('opening file', file_path.name)
+        self.current_file = self.open_file(file_path)
+
+    def next_file(self):
+        self.switch_file_by_index((self.current_index + 1) % len(self.file_list))
+
+    def open_file(self, path: Path) -> IOBase:
+        raise NotImplementedError()
+
+    def next(self) -> str:
+        raise NotImplementedError()

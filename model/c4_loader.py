@@ -1,12 +1,14 @@
-from pathlib import Path
 from io import IOBase
 from model.common import TextLoader
 import json
-import zstandard
+import gzip
+from pathlib import Path
 
-class PileLoader(TextLoader):
+READ_CHUNK_SIZE = 4096
+
+class C4Loader(TextLoader):
     def open_file(self, path: Path) -> IOBase:
-        return zstandard.open(path, 'rb')
+        return gzip.open(path, 'rb')
 
     def next(self) -> str:
         if self.current_file is None:
@@ -25,15 +27,5 @@ class PileLoader(TextLoader):
 
             parsed = json.loads(line)
             text = parsed['text']
-            if len(text) == 0:
-                continue
-
-            set_name = parsed['meta']['pile_set_name']
-            if set_name not in (
-                'BookCorpus2', 'Books3', 'Enron Emails', 'Gutenberg (PG-19)',
-                'HackerNews', 'OpenWebText2', 'Ubuntu IRC', 'Wikipedia (en)',
-                'StackExchange', 'Pile-CC', 'USPTO Backgrounds', 'OpenSubtitles',
-            ):
-                continue
-
-            return text
+            if len(text) > 0:
+                return text

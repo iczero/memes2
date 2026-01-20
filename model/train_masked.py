@@ -1,3 +1,4 @@
+from statistics import mean
 import os
 from typing import Iterator
 import contextlib
@@ -8,10 +9,9 @@ import signal
 import sys
 import time
 import torch
-import torch.nn.functional as F
-from torch import nn
 from model.common import ControlTokens, load_config, make_tokens, tokens_repr
-from model.pile_loader import filter_text, load_dataset
+from model.pile_loader import PileLoader
+from model.c4_loader import C4Loader
 from model.train_utils import Trainer
 from pathlib import Path
 
@@ -26,6 +26,7 @@ if os.environ.get('MLFLOW_TRACKING_URI', None) is None:
 arg_parser = argparse.ArgumentParser()
 arg_parser.add_argument('--config', type=str, help='path to config', default=None)
 arg_parser.add_argument('--data', type=str, help='path to dataset', required=True)
+arg_parser.add_argument('--data-type', type=str, help='type of dataset (pile or c4)', required=True)
 arg_parser.add_argument('--no-compile', action='store_true', help='disable torch.compile')
 arg_parser.add_argument('--use-cpu', action='store_true', help='use cpu instead of cuda')
 arg_parser.add_argument('--checkpoint-interval', type=int, help='checkpoint interval in seconds', default=7200)
@@ -122,15 +123,21 @@ def main():
         print('disabling torch.compile')
         trainer.enable_compile = False
 
-    model_config = trainer.model_config
+    #model_config = trainer.model_config
     train_config = trainer.train_config
 
     print(f'model parameter count: {sum(p.numel() for p in trainer.model.parameters()):n}')
 
-    data_iter = filter_text(load_dataset(open(args.data, 'rb')))
+    if args.data_type == 'pile':
+        text_loader = PileLoader.from_file(args.data)
+    elif args.data_type == 'c4':
+        text_loader = C4Loader.from_file(args.data)
+    else:
+        raise ValueError(f'unknown data type {args.data_type!r}')
 
     def seq_iter_fn() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        for text in data_iter:
+        while True:
+            text = text_loader.next()
             # TODO: make this less garbage
             max_len = train_config.train_max_seq_len - 2
             out_seq = make_tokens(
@@ -196,6 +203,9 @@ def main():
         while not go_away:
             trainer.zero_grad()
             total_seq_count = 0
+            losses = []
+            # is this even a word?
+            accuracies = []
             for acc_step in range(0, train_config.accumulate_gradients):
                 seq_count, packed, seq_lengths, out_mask = trainer.make_packed(seq_iter)
                 if seq_count == 0:
@@ -203,9 +213,9 @@ def main():
                     raise RuntimeError('seq_count is zero')
 
                 total_seq_count += seq_count
-                packed = packed.to(device=trainer.device)
-                seq_lengths = seq_lengths.to(device=trainer.device)
-                out_mask = out_mask.to(trainer.device)
+                packed = packed.to(device=trainer.device, non_blocking=True)
+                seq_lengths = seq_lengths.to(device=trainer.device, non_blocking=True)
+                out_mask = out_mask.to(trainer.device, non_blocking=True)
 
                 in_masked = packed[0]
                 out_seq = packed[1]
@@ -214,6 +224,10 @@ def main():
                 loss, sample = trainer.forward_batch(in_masked, out_seq, out_mask, seq_info)
                 loss.backward()
 
+                losses.append(loss.item())
+                accuracy = (sample[out_mask] == out_seq[out_mask]).to(dtype=torch.float).mean().item()
+                accuracies.append(accuracy)
+
             if train_config.accumulate_gradients > 1:
                 for param in trainer.model.parameters():
                     if param.grad is not None:
@@ -221,16 +235,19 @@ def main():
 
             grad_norm = trainer.clip_grad_norm()
             trainer.optimizer_step()
-            accuracy = (sample[out_mask] == out_seq[out_mask]).to(dtype=torch.float).mean().item()
+
+            agg_loss = mean(losses)
+            agg_accuracy = mean(accuracies)
+            grad_norm_f = grad_norm.item()
 
             mlflow.log_metrics({
-                'loss': loss.item(),
-                'grad_norm': grad_norm.item(),
-                'accuracy': accuracy,
+                'loss': agg_loss,
+                'grad_norm': grad_norm_f,
+                'accuracy': agg_accuracy,
                 'seq_count': total_seq_count,
             }, step=trainer.step)
 
-            print(f'step {trainer.step}: loss {loss.item():.6f}, accuracy {accuracy * 100:.3f}%, grad norm {grad_norm.item()}')
+            print(f'step {trainer.step}: loss {agg_loss:.6f}, accuracy {agg_accuracy * 100:.3f}%, grad norm {grad_norm_f}')
             if trainer.step % 64 == 0 and trainer.step > 0:
                 print('sample expected:', tokens_repr(out_seq[out_mask]))
                 print('sample output:  ', tokens_repr(sample[out_mask]))
